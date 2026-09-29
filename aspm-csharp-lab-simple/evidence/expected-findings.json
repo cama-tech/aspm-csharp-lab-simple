@@ -1,0 +1,61 @@
+{
+  "schemaVersion": 1,
+  "notes": "Expected observations for the isolated ASPM laboratory. Scanner severities can differ; record both expected and observed values.",
+  "cases": [
+    {"id":"SAST-CRITICAL-001","review":"SAST","scanner":"CodeQL","location":"src/AspmLab/Program.cs","marker":"NEW-SAST-001","expectedSeverity":"critical","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"SAST-HIGH-001","review":"SAST","scanner":"CodeQL","location":"src/AspmLab/Program.cs","marker":"BASELINE-SAST-001","expectedSeverity":"high","expectedClassification":"true_positive","duplicateGroup":"XSS-SEARCH"},
+    {"id":"SAST-MEDIUM-001","review":"SAST","scanner":"CodeQL","location":"src/AspmLab/Program.cs","marker":"MEDIUM-SAST-001","expectedSeverity":"medium","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"SAST-LOW-001","review":"SAST","scanner":"CodeQL","location":"src/AspmLab/Program.cs","marker":"LOW-SAST-001","expectedSeverity":"low","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"SAST-FP-001","review":"SAST","scanner":"CodeQL","location":"src/AspmLab/Program.cs","marker":"SECRET-FP-001","expectedSeverity":"low","expectedClassification":"false_positive","duplicateGroup":null},
+
+    {"id":"SCA-CRITICAL-001","review":"SCA","scanner":"Dependency Review/dotnet","location":"src/AspmLab/AspmLab.csproj","marker":"DNS 6.1.0","expectedSeverity":"critical","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"SCA-CRITICAL-002","review":"SCA","scanner":"Dependency Review/dotnet","location":"src/AspmLab/AspmLab.csproj","marker":"System.Text.Encodings.Web 4.7.0","expectedSeverity":"critical","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"SCA-HIGH-001","review":"SCA","scanner":"Dependency Review/dotnet","location":"src/AspmLab/AspmLab.csproj","marker":"Newtonsoft.Json 12.0.1","expectedSeverity":"high","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"SCA-MULTI-001","review":"SCA","scanner":"Dependency Review/dotnet","location":"src/AspmLab/AspmLab.csproj","marker":"SixLabors.ImageSharp 2.1.3","expectedSeverity":"medium","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"SCA-LOW-001","review":"SCA","scanner":"Dependency Review/dotnet","location":"src/AspmLab/AspmLab.csproj","marker":"EnumStringValues 4.0.0","expectedSeverity":"low","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"SCA-FP-001","review":"SCA","scanner":"Dependency Review/dotnet","location":"src/AspmLab/ScaFalsePositiveFixtures.cs","marker":"Fake.Vulnerable.Package 1.0.0","expectedSeverity":"none","expectedClassification":"false_positive","duplicateGroup":null},
+
+    {"id":"SECRET-CRITICAL-001","review":"Secrets","scanner":"Gitleaks","location":"fixtures/secrets/detectable-secrets.env","marker":"ASPM_LAB_AWS","expectedSeverity":"critical","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"SECRET-HIGH-001","review":"Secrets","scanner":"Gitleaks","location":"fixtures/secrets/detectable-secrets.env","marker":"ghp_LAB","expectedSeverity":"high","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"SECRET-MEDIUM-001","review":"Secrets","scanner":"Gitleaks","location":"fixtures/secrets/detectable-secrets.env","marker":"LAB_PASSWORD","expectedSeverity":"medium","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"SECRET-LOW-001","review":"Secrets","scanner":"Gitleaks","location":"fixtures/secrets/detectable-secrets.env","marker":"LAB_INTERNAL_KEY","expectedSeverity":"low","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"SECRET-FP-001","review":"Secrets","scanner":"Gitleaks","location":"fixtures/secrets/known-false-positives.txt","marker":"PUBLIC_DOC_ID","expectedSeverity":"low","expectedClassification":"false_positive","duplicateGroup":null},
+
+    {"id":"SBOM-APP-001","review":"SBOM","scanner":"CycloneDX","location":"src/AspmLab/AspmLab.csproj","marker":"AspmLab application","expectedSeverity":"informational","expectedClassification":"inventory","duplicateGroup":null},
+    {"id":"SBOM-DIRECT-001","review":"SBOM","scanner":"CycloneDX","location":"src/AspmLab/AspmLab.csproj","marker":"Newtonsoft.Json 12.0.1","expectedSeverity":"informational","expectedClassification":"inventory","duplicateGroup":null},
+    {"id":"SBOM-DIRECT-002","review":"SBOM","scanner":"CycloneDX","location":"src/AspmLab/AspmLab.csproj","marker":"System.Text.Encodings.Web 4.7.0","expectedSeverity":"informational","expectedClassification":"inventory","duplicateGroup":null},
+    {"id":"SBOM-DIRECT-003","review":"SBOM","scanner":"CycloneDX","location":"src/AspmLab/AspmLab.csproj","marker":"SixLabors.ImageSharp 2.1.3","expectedSeverity":"informational","expectedClassification":"inventory","duplicateGroup":null},
+    {"id":"SBOM-DIRECT-004","review":"SBOM","scanner":"CycloneDX","location":"src/AspmLab/AspmLab.csproj","marker":"DNS 6.1.0","expectedSeverity":"informational","expectedClassification":"inventory","duplicateGroup":null},
+    {"id":"SBOM-DIRECT-005","review":"SBOM","scanner":"CycloneDX","location":"src/AspmLab/AspmLab.csproj","marker":"EnumStringValues 4.0.0","expectedSeverity":"informational","expectedClassification":"inventory","duplicateGroup":null},
+    {"id":"SBOM-TRANSITIVE-001","review":"SBOM","scanner":"CycloneDX","location":"bom.json","marker":"transitive dependency","expectedSeverity":"informational","expectedClassification":"inventory","duplicateGroup":null},
+    {"id":"SBOM-LICENSE-001","review":"SBOM","scanner":"CycloneDX","location":"bom.json","marker":"component license","expectedSeverity":"informational","expectedClassification":"inventory","duplicateGroup":null},
+    {"id":"SBOM-FP-001","review":"SBOM","scanner":"CycloneDX","location":"src/AspmLab/ScaFalsePositiveFixtures.cs","marker":"Fake.Vulnerable.Package absent","expectedSeverity":"informational","expectedClassification":"false_positive","duplicateGroup":null},
+
+    {"id":"IAC-CRITICAL-001","review":"IaC","scanner":"Checkov","location":"infra/main.tf","marker":"LAB-IAC-CRITICAL-001","expectedSeverity":"critical","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"IAC-HIGH-001","review":"IaC","scanner":"Checkov","location":"infra/main.tf","marker":"LAB-IAC-001","expectedSeverity":"high","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"IAC-MEDIUM-001","review":"IaC","scanner":"Checkov","location":"infra/main.tf","marker":"LAB-IAC-MEDIUM-001","expectedSeverity":"medium","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"IAC-LOW-001","review":"IaC","scanner":"Checkov","location":"infra/main.tf","marker":"LAB-IAC-LOW-001","expectedSeverity":"low","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"IAC-FP-001","review":"IaC","scanner":"Checkov","location":"infra/false-positive.tf","marker":"localhost-only ingress","expectedSeverity":"low","expectedClassification":"false_positive","duplicateGroup":null},
+
+    {"id":"CONTAINER-CRITICAL-001","review":"Container","scanner":"Trivy","location":"image:aspm-lab","marker":"critical application dependency","expectedSeverity":"critical","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"CONTAINER-HIGH-001","review":"Container","scanner":"Trivy","location":"Dockerfile","marker":"runs as root","expectedSeverity":"high","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"CONTAINER-HIGH-002","review":"Container","scanner":"Trivy","location":"image:aspm-lab","marker":"Newtonsoft.Json 12.0.1","expectedSeverity":"high","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"CONTAINER-MEDIUM-001","review":"Container","scanner":"Trivy","location":"image:aspm-lab","marker":"SixLabors.ImageSharp 2.1.3","expectedSeverity":"medium","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"CONTAINER-LOW-001","review":"Container","scanner":"Trivy","location":"Dockerfile","marker":"no HEALTHCHECK","expectedSeverity":"low","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"CONTAINER-LOW-002","review":"Container","scanner":"Trivy","location":"image:aspm-lab","marker":"EnumStringValues 4.0.0","expectedSeverity":"low","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"CONTAINER-FP-001","review":"Container","scanner":"Trivy","location":"docker-compose.yml","marker":"127.0.0.1:8080:8080","expectedSeverity":"informational","expectedClassification":"false_positive","duplicateGroup":null},
+
+    {"id":"DAST-CRITICAL-001","review":"DAST","scanner":"OWASP ZAP","location":"/api/diagnostic","marker":"controlled command execution","expectedSeverity":"critical","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"DAST-HIGH-001","review":"DAST","scanner":"OWASP ZAP","location":"/api/search","marker":"reflected input","expectedSeverity":"high","expectedClassification":"true_positive","duplicateGroup":"XSS-SEARCH"},
+    {"id":"DAST-HIGH-002","review":"DAST","scanner":"OWASP ZAP","location":"/api/file","marker":"path traversal","expectedSeverity":"high","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"DAST-MEDIUM-001","review":"DAST","scanner":"OWASP ZAP","location":"/api/redirect","marker":"open redirect","expectedSeverity":"medium","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"DAST-LOW-001","review":"DAST","scanner":"OWASP ZAP","location":"/health","marker":"missing security headers","expectedSeverity":"low","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"DAST-FP-001","review":"DAST","scanner":"OWASP ZAP","location":"/health","marker":"no dangerous alert","expectedSeverity":"informational","expectedClassification":"false_positive","duplicateGroup":null},
+
+    {"id":"BUSINESS-CRITICAL-001","review":"Business","scanner":"Manual/xUnit","location":"/api/orders/{id}/approve","marker":"role supplied by caller","expectedSeverity":"critical","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"BUSINESS-HIGH-001","review":"Business","scanner":"Manual/xUnit","location":"/api/orders/{id}","marker":"IDOR/BOLA","expectedSeverity":"high","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"BUSINESS-HIGH-002","review":"Business","scanner":"Manual/xUnit","location":"/api/orders/quote","marker":"client total trusted","expectedSeverity":"high","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"BUSINESS-MEDIUM-001","review":"Business","scanner":"Manual/xUnit","location":"/api/transfers","marker":"missing idempotency","expectedSeverity":"medium","expectedClassification":"true_positive","duplicateGroup":null},
+    {"id":"BUSINESS-MEDIUM-002","review":"Business","scanner":"Manual/xUnit","location":"/api/limits/check","marker":"limit splitting","expectedSeverity":"medium","expectedClassification":"true_positive","duplicateGroup":null}
+  ]
+}
