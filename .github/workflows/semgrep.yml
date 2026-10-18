@@ -57,14 +57,15 @@ jobs:
           DD_PRODUCT: ${{ vars.DEFECTDOJO_PRODUCT_NAME }}
           DD_ENGAGEMENT: ${{ vars.DEFECTDOJO_ENGAGEMENT_NAME }}
         run: |
-          test -s semgrep.json
-          test -n "$DD_URL"
-          test -n "$DD_TOKEN"
-          test -n "$DD_PRODUCT_TYPE"
-          test -n "$DD_PRODUCT"
-          test -n "$DD_ENGAGEMENT"
+          test -s semgrep.json || { echo "::error::No se generó semgrep.json"; exit 1; }
+          [ -n "$DD_URL" ] || { echo "::error::Falta DEFECTDOJO_URL en Dev"; exit 1; }
+          [ -n "$DD_TOKEN" ] || { echo "::error::Falta DEFECTDOJO_API_TOKEN en Dev"; exit 1; }
+          [ -n "$DD_PRODUCT_TYPE" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_TYPE_NAME en Dev"; exit 1; }
+          [ -n "$DD_PRODUCT" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_NAME en Dev"; exit 1; }
+          [ -n "$DD_ENGAGEMENT" ] || { echo "::error::Falta DEFECTDOJO_ENGAGEMENT_NAME en Dev"; exit 1; }
 
           BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          echo "Enviando resultados: $DD_PRODUCT / $DD_ENGAGEMENT / Semgrep $BRANCH"
 
           curl --fail-with-body --silent --show-error \
             --request POST \
