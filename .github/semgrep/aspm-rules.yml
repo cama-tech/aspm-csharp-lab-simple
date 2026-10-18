@@ -1,0 +1,36 @@
+rules:
+  - id: aspm.sast.controlled-process-execution
+    languages: [csharp]
+    severity: HIGH
+    message: "OS command process execution reaches ProcessStartInfo and requires allowlist validation."
+    pattern-regex: 'new\s+ProcessStartInfo\s*\('
+
+  - id: aspm.sast.reflected-xss
+    languages: [csharp]
+    severity: HIGH
+    message: "Cross-site scripting (XSS) risk: user input is interpolated into HTML without output encoding."
+    pattern-regex: 'Search result:\s*\{q\}'
+
+  - id: aspm.sast.open-redirect
+    languages: [csharp]
+    severity: MEDIUM
+    message: "Open redirect: an externally controlled URL reaches Results.Redirect."
+    pattern-regex: 'Results\.Redirect\s*\(\s*url'
+
+  - id: aspm.sast.path-traversal
+    languages: [csharp]
+    severity: HIGH
+    message: "Path traversal: a user-controlled path is combined with the laboratory root."
+    pattern-regex: 'Path\.Combine\s*\(\s*labRoot\s*,\s*name'
+
+  - id: aspm.sast.sensitive-log
+    languages: [csharp]
+    severity: MEDIUM
+    message: "Sensitive information is written to application logs."
+    pattern-regex: 'LogInformation\s*\(\s*"Login audit[^\n]*\{Token\}[^\n]*audit\.Token'
+
+  - id: aspm.sast.public-documentation-id
+    languages: [csharp]
+    severity: INFO
+    message: "Hardcoded secret-shaped public documentation identifier; controlled false positive."
+    pattern-regex: 'PublicDocumentationId\s*=\s*"ghp_[A-Za-z0-9]+"'
