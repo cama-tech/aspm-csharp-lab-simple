@@ -1,0 +1,10 @@
+name: Prueba de Actions
+
+on:
+  workflow_dispatch:
+
+jobs:
+  prueba:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "GitHub reconoció el workflow"
