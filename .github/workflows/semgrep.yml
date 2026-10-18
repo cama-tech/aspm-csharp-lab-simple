@@ -51,11 +51,11 @@ jobs:
       - name: Send results to DefectDojo
         if: github.event_name != 'pull_request'
         env:
-          DD_URL: ${{ vars.DEFECTDOJO_URL }}
+          DD_URL: ${{ secrets.DEFECTDOJO_URL }}
           DD_TOKEN: ${{ secrets.DEFECTDOJO_API_TOKEN }}
-          DD_PRODUCT_TYPE: ${{ vars.DEFECTDOJO_PRODUCT_TYPE_NAME }}
-          DD_PRODUCT: ${{ vars.DEFECTDOJO_PRODUCT_NAME }}
-          DD_ENGAGEMENT: ${{ vars.DEFECTDOJO_ENGAGEMENT_NAME }}
+          DD_PRODUCT_TYPE: ${{ secrets.DEFECTDOJO_PRODUCT_TYPE_NAME }}
+          DD_PRODUCT: ${{ secrets.DEFECTDOJO_PRODUCT_NAME }}
+          DD_ENGAGEMENT: ${{ secrets.DEFECTDOJO_ENGAGEMENT_NAME }}
         run: |
           test -s semgrep.json || { echo "::error::No se generó semgrep.json"; exit 1; }
           [ -n "$DD_URL" ] || { echo "::error::Falta DEFECTDOJO_URL en Dev"; exit 1; }
