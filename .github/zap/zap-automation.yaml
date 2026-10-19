@@ -45,20 +45,10 @@ jobs:
 
   - type: report
     parameters:
-      template: traditional-xml
+      template: traditional-html
       reportDir: /zap/wrk
-      reportFile: zap-results.xml
+      reportFile: zap-report.html
       reportTitle: ASPM DAST Report
-    risks:
-      - high
-      - medium
-      - low
-      - info
-    confidences:
-      - high
-      - medium
-      - low
-      - falsepositive
 
   - type: report
     parameters:
@@ -66,4 +56,3 @@ jobs:
       reportDir: /zap/wrk
       reportFile: zap-report.sarif.json
       reportTitle: ASPM DAST SARIF Report
-
