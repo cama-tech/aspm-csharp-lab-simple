@@ -134,6 +134,7 @@ jobs:
 
           OUT="$RUNNER_TEMP/dast-results"
 
+          set +e
           docker run --rm \
             --network aspm-dast-network \
             -u 0:0 \
@@ -141,11 +142,23 @@ jobs:
             ghcr.io/zaproxy/zaproxy:stable \
             zap.sh -cmd -autorun /zap/wrk/zap-automation.yaml \
             > "$OUT/zap-console.log" 2>&1
+          ZAP_EXIT=$?
+          set -e
 
-          tail -n 100 "$OUT/zap-console.log"
+          if [ -f "$OUT/zap-console.log" ]; then
+            tail -n 150 "$OUT/zap-console.log"
+          else
+            echo "::error::ZAP no creó zap-console.log"
+          fi
 
+          echo "Código de salida de ZAP: $ZAP_EXIT"
           echo "Archivos generados:"
           ls -lah "$OUT"
+
+          if [ "$ZAP_EXIT" -ne 0 ]; then
+            echo "::error::ZAP terminó con error. Revisa zap-console.log."
+            exit "$ZAP_EXIT"
+          fi
 
           if [ ! -s "$OUT/zap-results.json" ]; then
             echo "::error::No existe o está vacío zap-results.json"
@@ -239,7 +252,10 @@ jobs:
 
       - name: Mostrar logs si falla
         if: failure()
-        run: docker logs aspm-dast-app || true
+        shell: bash
+        run: |
+          tail -n 150 "$RUNNER_TEMP/dast-results/zap-console.log" || true
+          docker logs aspm-dast-app || true
 
       - name: Detener aplicación
         if: always()
