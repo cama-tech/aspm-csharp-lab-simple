@@ -1,4 +1,4 @@
-name: DAST OWASP ZAP
+name: ASPM - DAST OWASP ZAP
 
 on:
   workflow_dispatch:
@@ -144,18 +144,37 @@ jobs:
 
           tail -n 100 "$OUT/zap-console.log"
 
-          test -s "$OUT/zap-results.json"
-          jq -e '.site | type == "array"' "$OUT/zap-results.json" > /dev/null
+          echo "Archivos generados:"
+          ls -lah "$OUT"
 
-          test -s "$OUT/zap-results.xml"
-          python -c \
-            "import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])" \
-            "$OUT/zap-results.xml"
-
-          grep -Fq '[custom-dast-rules] Evaluando' "$OUT/zap-console.log" || {
-            echo "::error::No se encontró evidencia de ejecución de las reglas personalizadas."
+          if [ ! -s "$OUT/zap-results.json" ]; then
+            echo "::error::No existe o está vacío zap-results.json"
             exit 1
-          }
+          fi
+
+          if ! jq -e '.site | type == "array"' "$OUT/zap-results.json" > /dev/null; then
+            echo "::error::zap-results.json no tiene la estructura esperada"
+            exit 1
+          fi
+
+          if [ ! -s "$OUT/zap-results.xml" ]; then
+            echo "::error::No existe o está vacío zap-results.xml"
+            exit 1
+          fi
+
+          if ! python -c \
+            "import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])" \
+            "$OUT/zap-results.xml"; then
+            echo "::error::zap-results.xml no es XML válido"
+            exit 1
+          fi
+
+          if ! grep -Fq '[custom-dast-rules] Evaluando' "$OUT/zap-console.log"; then
+            echo "::error::No se encontró evidencia de ejecución de las reglas personalizadas"
+            exit 1
+          fi
+
+          echo "Informes válidos y reglas personalizadas ejecutadas."
 
       - name: Guardar resultados de ZAP como artefacto
         if: always()
