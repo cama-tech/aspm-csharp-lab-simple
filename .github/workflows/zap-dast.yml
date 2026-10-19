@@ -1,0 +1,224 @@
+name: ASPM - DAST OWASP ZAP
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, prueba-codeql]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  dast:
+    name: OWASP ZAP - DAST
+    runs-on: ubuntu-latest
+    environment: Dev
+
+    steps:
+      - name: Obtener código
+        uses: actions/checkout@v4
+
+      - name: Preparar resultados
+        shell: bash
+        run: mkdir -p "$RUNNER_TEMP/dast-results"
+
+      - name: Localizar Dockerfile
+        id: dockerfile
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE=$(find . -type f -name Dockerfile \
+            -not -path './.git/*' \
+            | sort | head -n 1)
+
+          if [ -z "$FILE" ]; then
+            echo "::error::No se encontró un Dockerfile para iniciar la aplicación."
+            exit 1
+          fi
+
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "context=$(dirname "$FILE")" >> "$GITHUB_OUTPUT"
+
+      - name: Construir aplicación
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker build \
+            -f "${{ steps.dockerfile.outputs.file }}" \
+            -t aspm-lab-docker-app:local \
+            "${{ steps.dockerfile.outputs.context }}"
+
+      - name: Iniciar aplicación para el escaneo
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          docker network create aspm-dast-network
+
+          docker run -d \
+            --name aspm-dast-app \
+            --network aspm-dast-network \
+            --network-alias app \
+            -p 127.0.0.1:8080:8080 \
+            -e ASPNETCORE_ENVIRONMENT=Development \
+            -e Lab__EnableControlledCommandEndpoint=true \
+            --read-only \
+            --tmpfs /tmp \
+            aspm-lab-docker-app:local
+
+      - name: Esperar aplicación
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/health -o /dev/null; then
+              echo "Aplicación disponible."
+              exit 0
+            fi
+            sleep 5
+          done
+
+          docker logs aspm-dast-app
+          echo "::error::La aplicación no respondió en /health."
+          exit 1
+
+      - name: Preparar OpenAPI para ZAP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="$RUNNER_TEMP/dast-results"
+
+          curl -fsS \
+            http://127.0.0.1:8080/swagger/v1/swagger.json \
+            -o "$OUT/openapi-original.json"
+
+          jq -e '.paths["/api/lab-results"].delete' \
+            "$OUT/openapi-original.json" > /dev/null
+
+          jq '
+            del(.paths["/api/lab-results"].delete, .paths["/api/redirect"])
+          ' "$OUT/openapi-original.json" > "$OUT/openapi-zap.json"
+
+          jq -e '
+            .paths["/api/lab-results"].delete == null
+            and .paths["/api/lab-results"].get != null
+            and .paths["/api/lab-results"].post != null
+          ' "$OUT/openapi-zap.json" > /dev/null
+
+      - name: Preparar reglas y configuración de ZAP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="$RUNNER_TEMP/dast-results"
+          mkdir -p "$OUT/scripts"
+
+          cp .github/zap/custom-dast-rules.js "$OUT/scripts/"
+          cp .github/zap/zap-automation.yaml "$OUT/"
+
+          test -s "$OUT/scripts/custom-dast-rules.js"
+          test -s "$OUT/zap-automation.yaml"
+
+      - name: Ejecutar OWASP ZAP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="$RUNNER_TEMP/dast-results"
+
+          docker run --rm \
+            --network aspm-dast-network \
+            -u 0:0 \
+            -v "$OUT:/zap/wrk:rw" \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap.sh -cmd -autorun /zap/wrk/zap-automation.yaml \
+            > "$OUT/zap-console.log" 2>&1
+
+          tail -n 100 "$OUT/zap-console.log"
+
+          test -s "$OUT/zap-results.json"
+          test -s "$OUT/zap-report.html"
+
+          # ZAP debe producir el JSON tradicional que importa DefectDojo.
+          jq -e '.site | type == "array"' "$OUT/zap-results.json" > /dev/null
+
+          grep -Fq '[custom-dast-rules] Evaluando' "$OUT/zap-console.log" || {
+            echo "::error::No se encontró evidencia de ejecución de las reglas personalizadas."
+            exit 1
+          }
+
+      - name: Guardar resultados de ZAP como artefacto
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aspm-dast-zap-results
+          path: |
+            ${{ runner.temp }}/dast-results/zap-results.json
+            ${{ runner.temp }}/dast-results/zap-report.html
+            ${{ runner.temp }}/dast-results/zap-console.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Enviar resultados a DefectDojo
+        if: >-
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          DD_URL: ${{ secrets.DEFECTDOJO_URL }}
+          DD_TOKEN: ${{ secrets.DEFECTDOJO_API_TOKEN }}
+          DD_PRODUCT_TYPE: ${{ secrets.DEFECTDOJO_PRODUCT_TYPE_NAME }}
+          DD_PRODUCT: ${{ secrets.DEFECTDOJO_PRODUCT_NAME }}
+          DD_ENGAGEMENT: ${{ secrets.DEFECTDOJO_ENGAGEMENT_NAME }}
+          DD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPORT="$RUNNER_TEMP/dast-results/zap-results.json"
+
+          test -s "$REPORT" || {
+            echo "::error::No se generó zap-results.json"
+            exit 1
+          }
+
+          jq -e '.site | type == "array"' "$REPORT" > /dev/null
+
+          [ -n "$DD_URL" ] || { echo "::error::Falta DEFECTDOJO_URL en Dev"; exit 1; }
+          [ -n "$DD_TOKEN" ] || { echo "::error::Falta DEFECTDOJO_API_TOKEN en Dev"; exit 1; }
+          [ -n "$DD_PRODUCT_TYPE" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_TYPE_NAME en Dev"; exit 1; }
+          [ -n "$DD_PRODUCT" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_NAME en Dev"; exit 1; }
+          [ -n "$DD_ENGAGEMENT" ] || { echo "::error::Falta DEFECTDOJO_ENGAGEMENT_NAME en Dev"; exit 1; }
+
+          BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          echo "Enviando OWASP ZAP: $DD_PRODUCT / $DD_ENGAGEMENT / $BRANCH"
+
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            "${DD_URL%/}/api/v2/reimport-scan/" \
+            --header "Authorization: Token $DD_TOKEN" \
+            --form "scan_type=ZAP Scan" \
+            --form "product_type_name=$DD_PRODUCT_TYPE" \
+            --form "product_name=$DD_PRODUCT" \
+            --form "engagement_name=$DD_ENGAGEMENT" \
+            --form "test_title=OWASP ZAP DAST $BRANCH" \
+            --form "auto_create_context=true" \
+            --form "branch_tag=$BRANCH" \
+            --form "commit_hash=$DD_COMMIT" \
+            --form "file=@$REPORT;type=application/json"
+
+      - name: Mostrar logs si falla
+        if: failure()
+        run: docker logs aspm-dast-app || true
+
+      - name: Detener aplicación
+        if: always()
+        shell: bash
+        run: |
+          docker rm -f aspm-dast-app || true
+          docker network rm aspm-dast-network || true
