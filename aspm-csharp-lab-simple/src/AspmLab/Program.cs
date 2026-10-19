@@ -403,6 +403,13 @@ app.MapGet("/api/test-xss", (string? q) =>
     return Results.Content(html, "text/html");
 });
 
+// PR-TEST-XSS-2: vulnerabilidad intencional para probar el análisis del PR.
+app.MapGet("/api/test-xss-2", (string? q) =>
+{
+    var html = $"<html><body>Search result: {q}</body></html>";
+    return Results.Content(html, "text/html");
+});
+
 // BASELINE-SAST-002: unvalidated redirect.
 app.MapGet("/api/redirect", (string? url) => Results.Redirect(url ?? "/"));
 
