@@ -204,6 +204,7 @@ jobs:
           DD_PRODUCT: ${{ secrets.DEFECTDOJO_PRODUCT_NAME }}
           DD_ENGAGEMENT: ${{ secrets.DEFECTDOJO_ENGAGEMENT_NAME }}
           DD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          DD_PATCH_DELAY_SECONDS: "0.2"
           ZAP_XML: ${{ runner.temp }}/dast-results/zap-results.xml
           DD_RESPONSE: ${{ runner.temp }}/dast-results/dd-import-response.json
         shell: bash
@@ -223,7 +224,7 @@ jobs:
 
           BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
 
-          # Importa el reporte XML y guarda la respuesta, que incluye el ID del test.
+          # Importar el XML de ZAP y guardar la respuesta con el ID del test.
           curl --fail-with-body --silent --show-error \
             --request POST \
             "${DD_URL%/}/api/v2/reimport-scan/" \
@@ -241,17 +242,18 @@ jobs:
 
           cat "$DD_RESPONSE"
 
-          # Usa las instancias del XML para completar Steps to Reproduce.
           python - <<'PY'
           import json
           import os
           import time
+          import urllib.error
           import urllib.parse
           import urllib.request
           import xml.etree.ElementTree as ET
 
           base_url = os.environ["DD_URL"].rstrip("/")
           token = os.environ["DD_TOKEN"]
+          patch_delay = float(os.environ.get("DD_PATCH_DELAY_SECONDS", "0.2"))
 
           def api(method, url, body=None):
               data = None if body is None else json.dumps(body).encode("utf-8")
@@ -262,12 +264,34 @@ jobs:
               if data is not None:
                   headers["Content-Type"] = "application/json"
 
-              request = urllib.request.Request(
-                  url, data=data, headers=headers, method=method
-              )
-              with urllib.request.urlopen(request, timeout=30) as response:
-                  content = response.read()
-                  return json.loads(content) if content else {}
+              for attempt in range(5):
+                  request = urllib.request.Request(
+                      url, data=data, headers=headers, method=method
+                  )
+                  try:
+                      with urllib.request.urlopen(request, timeout=30) as response:
+                          content = response.read()
+                          return json.loads(content) if content else {}
+                  except urllib.error.HTTPError as error:
+                      if error.code not in (429, 500, 502, 503, 504) or attempt == 4:
+                          detail = error.read().decode("utf-8", errors="replace")
+                          raise RuntimeError(
+                              f"DefectDojo respondió HTTP {error.code}: {detail}"
+                          ) from error
+
+                      try:
+                          wait_seconds = float(error.headers.get("Retry-After", ""))
+                      except (TypeError, ValueError):
+                          wait_seconds = min(2 ** attempt, 30)
+
+                      print(
+                          f"HTTP {error.code}; reintentando en "
+                          f"{wait_seconds:g} segundos..."
+                      )
+                      time.sleep(wait_seconds)
+
+          def normalize_title(value):
+              return " ".join((value or "").casefold().split())
 
           with open(os.environ["DD_RESPONSE"], encoding="utf-8") as file:
               imported = json.load(file)
@@ -280,7 +304,7 @@ jobs:
                   f"No se encontró el ID del test en la respuesta: {imported}"
               )
 
-          # Indexa las instancias de ZAP por ID de regla y título del finding.
+          # Preparar los pasos de reproducción desde las instancias del XML.
           root = ET.parse(os.environ["ZAP_XML"]).getroot()
           report_findings = {}
 
@@ -307,12 +331,17 @@ jobs:
                   instances.append("\n".join(lines))
 
               if title and rule_id and instances:
-                  report_findings[(rule_id, title)] = instances
+                  report_findings.setdefault((rule_id, title), []).extend(instances)
 
           if not report_findings:
               raise SystemExit("El XML de ZAP no contiene instancias para reproducir.")
 
-          # Espera que el test tenga findings y consulta todas las páginas.
+          expected_keys = {
+              (rule_id, normalize_title(title))
+              for rule_id, title in report_findings
+          }
+
+          # Consultar todos los findings asociados al test, siguiendo la paginación.
           findings = []
           for attempt in range(12):
               url = (
@@ -328,14 +357,16 @@ jobs:
 
               found_keys = {
                   (
-                      str(finding.get("vuln_id_from_tool") or ""),
-                      finding.get("title", ""),
+                      str(finding.get("vuln_id_from_tool") or "").strip(),
+                      normalize_title(finding.get("title")),
                   )
                   for finding in findings
               }
-              if set(report_findings).issubset(found_keys):
+
+              if expected_keys.issubset(found_keys):
                   break
-              time.sleep(5)
+              if attempt < 11:
+                  time.sleep(5)
 
           updated = 0
           missing = []
@@ -343,8 +374,8 @@ jobs:
           for (rule_id, title), instances in report_findings.items():
               matches = [
                   finding for finding in findings
-                  if str(finding.get("vuln_id_from_tool") or "") == rule_id
-                  and finding.get("title") == title
+                  if str(finding.get("vuln_id_from_tool") or "").strip() == rule_id
+                  and normalize_title(finding.get("title")) == normalize_title(title)
               ]
 
               if not matches:
@@ -366,7 +397,8 @@ jobs:
                       {"steps_to_reproduce": steps},
                   )
                   updated += 1
-                  print(f"Actualizado finding {finding['id']}: {title}")
+                  print(f"Actualizado finding {finding['id']}: {finding.get('title')}")
+                  time.sleep(patch_delay)
 
           if missing:
               raise SystemExit(
