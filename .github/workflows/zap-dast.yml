@@ -193,7 +193,7 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Enviar resultados a DefectDojo
+      - name: Enviar resultados y completar pasos de reproducción en DefectDojo
         if: >-
           github.event_name != 'pull_request' ||
           github.event.pull_request.head.repo.full_name == github.repository
@@ -204,20 +204,16 @@ jobs:
           DD_PRODUCT: ${{ secrets.DEFECTDOJO_PRODUCT_NAME }}
           DD_ENGAGEMENT: ${{ secrets.DEFECTDOJO_ENGAGEMENT_NAME }}
           DD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          ZAP_XML: ${{ runner.temp }}/dast-results/zap-results.xml
+          DD_RESPONSE: ${{ runner.temp }}/dast-results/dd-import-response.json
         shell: bash
         run: |
           set -euo pipefail
 
-          REPORT="$RUNNER_TEMP/dast-results/zap-results.xml"
-
-          test -s "$REPORT" || {
+          test -s "$ZAP_XML" || {
             echo "::error::No se generó zap-results.xml"
             exit 1
           }
-
-          python -c \
-            "import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])" \
-            "$REPORT"
 
           [ -n "$DD_URL" ] || { echo "::error::Falta DEFECTDOJO_URL en Dev"; exit 1; }
           [ -n "$DD_TOKEN" ] || { echo "::error::Falta DEFECTDOJO_API_TOKEN en Dev"; exit 1; }
@@ -226,8 +222,8 @@ jobs:
           [ -n "$DD_ENGAGEMENT" ] || { echo "::error::Falta DEFECTDOJO_ENGAGEMENT_NAME en Dev"; exit 1; }
 
           BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
-          echo "Enviando OWASP ZAP: $DD_PRODUCT / $DD_ENGAGEMENT / $BRANCH"
 
+          # Importa el reporte XML y guarda la respuesta, que incluye el ID del test.
           curl --fail-with-body --silent --show-error \
             --request POST \
             "${DD_URL%/}/api/v2/reimport-scan/" \
@@ -240,7 +236,146 @@ jobs:
             --form "auto_create_context=true" \
             --form "branch_tag=$BRANCH" \
             --form "commit_hash=$DD_COMMIT" \
-            --form "file=@$REPORT;type=application/xml"
+            --form "file=@$ZAP_XML;type=application/xml" \
+            --output "$DD_RESPONSE"
+
+          cat "$DD_RESPONSE"
+
+          # Usa las instancias del XML para completar Steps to Reproduce.
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.parse
+          import urllib.request
+          import xml.etree.ElementTree as ET
+
+          base_url = os.environ["DD_URL"].rstrip("/")
+          token = os.environ["DD_TOKEN"]
+
+          def api(method, url, body=None):
+              data = None if body is None else json.dumps(body).encode("utf-8")
+              headers = {
+                  "Authorization": f"Token {token}",
+                  "Accept": "application/json",
+              }
+              if data is not None:
+                  headers["Content-Type"] = "application/json"
+
+              request = urllib.request.Request(
+                  url, data=data, headers=headers, method=method
+              )
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  content = response.read()
+                  return json.loads(content) if content else {}
+
+          with open(os.environ["DD_RESPONSE"], encoding="utf-8") as file:
+              imported = json.load(file)
+
+          test_id = imported.get("test") or imported.get("test_id")
+          if isinstance(test_id, dict):
+              test_id = test_id.get("id")
+          if not test_id:
+              raise SystemExit(
+                  f"No se encontró el ID del test en la respuesta: {imported}"
+              )
+
+          # Indexa las instancias de ZAP por ID de regla y título del finding.
+          root = ET.parse(os.environ["ZAP_XML"]).getroot()
+          report_findings = {}
+
+          for item in root.findall("./site/alerts/alertitem"):
+              title = (item.findtext("alert") or "").strip()
+              rule_id = (item.findtext("pluginid") or "").strip()
+              instances = []
+
+              for instance in item.findall("./instances/instance"):
+                  method = (instance.findtext("method") or "HTTP").strip()
+                  uri = (instance.findtext("uri") or "").strip()
+                  param = (instance.findtext("param") or "").strip()
+                  attack = (instance.findtext("attack") or "").strip()
+                  evidence = (instance.findtext("evidence") or "").strip()
+
+                  lines = [f"Enviar una solicitud {method} a: {uri}"]
+                  if param:
+                      lines.append(f"Parámetro: {param}")
+                  if attack:
+                      lines.append(f"Valor enviado: {attack}")
+                  if evidence:
+                      lines.append(f"Evidencia observada: {evidence}")
+
+                  instances.append("\n".join(lines))
+
+              if title and rule_id and instances:
+                  report_findings[(rule_id, title)] = instances
+
+          if not report_findings:
+              raise SystemExit("El XML de ZAP no contiene instancias para reproducir.")
+
+          # Espera que el test tenga findings y consulta todas las páginas.
+          findings = []
+          for attempt in range(12):
+              url = (
+                  f"{base_url}/api/v2/findings/?"
+                  + urllib.parse.urlencode({"test": test_id, "limit": 200})
+              )
+              findings = []
+
+              while url:
+                  page = api("GET", url)
+                  findings.extend(page.get("results", []))
+                  url = page.get("next")
+
+              found_keys = {
+                  (
+                      str(finding.get("vuln_id_from_tool") or ""),
+                      finding.get("title", ""),
+                  )
+                  for finding in findings
+              }
+              if set(report_findings).issubset(found_keys):
+                  break
+              time.sleep(5)
+
+          updated = 0
+          missing = []
+
+          for (rule_id, title), instances in report_findings.items():
+              matches = [
+                  finding for finding in findings
+                  if str(finding.get("vuln_id_from_tool") or "") == rule_id
+                  and finding.get("title") == title
+              ]
+
+              if not matches:
+                  missing.append(f"{rule_id}: {title}")
+                  continue
+
+              steps = (
+                  f"Hallazgo detectado por OWASP ZAP. Regla: {rule_id}.\n\n"
+                  + "\n\n".join(
+                      f"Instancia {number}:\n{details}"
+                      for number, details in enumerate(instances, start=1)
+                  )
+              )
+
+              for finding in matches:
+                  api(
+                      "PATCH",
+                      f"{base_url}/api/v2/findings/{finding['id']}/",
+                      {"steps_to_reproduce": steps},
+                  )
+                  updated += 1
+                  print(f"Actualizado finding {finding['id']}: {title}")
+
+          if missing:
+              raise SystemExit(
+                  "No se encontraron findings importados para: "
+                  + "; ".join(missing)
+              )
+
+          print(f"Pasos de reproducción actualizados en {updated} findings.")
+          PY
 
       - name: Mostrar logs si falla
         if: failure()
