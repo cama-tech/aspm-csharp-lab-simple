@@ -1,0 +1,115 @@
+name: ASPM - SBOM CycloneDX y Grype
+
+on:
+  push:
+    branches: [main, prueba-codeql]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sbom:
+    name: Generar SBOM, analizar y enviar a DefectDojo
+    runs-on: ubuntu-latest
+    environment: Dev
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar directorio de resultados
+        run: mkdir -p artifacts/sbom
+
+      - name: Generar SBOM CycloneDX con Syft
+        run: |
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/repo:ro" \
+            anchore/syft:latest \
+            scan dir:/repo \
+            --exclude "**/bin/**" \
+            --exclude "**/obj/**" \
+            -o cyclonedx-json \
+            > artifacts/sbom/bom.json
+
+      - name: Comprobar archivo CycloneDX
+        run: |
+          test -s artifacts/sbom/bom.json
+          jq -e '.bomFormat == "CycloneDX"' artifacts/sbom/bom.json
+          jq -e '.components | type == "array"' artifacts/sbom/bom.json
+
+      - name: Mostrar componentes encontrados
+        run: |
+          jq -r '
+            .components[]? |
+            [.name, .version, (.purl // "Sin PURL")] |
+            @tsv
+          ' artifacts/sbom/bom.json
+
+      - name: Analizar SBOM con Grype
+        run: |
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}/artifacts/sbom:/artifacts:ro" \
+            anchore/grype:latest \
+            sbom:/artifacts/bom.json \
+            -o json \
+            > artifacts/sbom/grype.json
+
+      - name: Comprobar resultado Grype
+        run: |
+          test -s artifacts/sbom/grype.json
+          jq -e '.matches | type == "array"' artifacts/sbom/grype.json
+          echo "Vulnerabilidades encontradas: $(jq '.matches | length' artifacts/sbom/grype.json)"
+
+      - name: Guardar SBOM e informe de Grype
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aspm-sbom-grype
+          path: |
+            artifacts/sbom/bom.json
+            artifacts/sbom/grype.json
+          if-no-files-found: warn
+
+      - name: Enviar resultados a DefectDojo
+        if: >-
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          DD_URL: ${{ secrets.DEFECTDOJO_URL }}
+          DD_TOKEN: ${{ secrets.DEFECTDOJO_API_TOKEN }}
+          DD_PRODUCT_TYPE: ${{ secrets.DEFECTDOJO_PRODUCT_TYPE_NAME }}
+          DD_PRODUCT: ${{ secrets.DEFECTDOJO_PRODUCT_NAME }}
+          DD_ENGAGEMENT: ${{ secrets.DEFECTDOJO_ENGAGEMENT_NAME }}
+          DD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          REPORT="artifacts/sbom/grype.json"
+
+          test -s "$REPORT" || {
+            echo "::error::No se generó artifacts/sbom/grype.json"
+            exit 1
+          }
+          [ -n "$DD_URL" ] || { echo "::error::Falta DEFECTDOJO_URL en Dev"; exit 1; }
+          [ -n "$DD_TOKEN" ] || { echo "::error::Falta DEFECTDOJO_API_TOKEN en Dev"; exit 1; }
+          [ -n "$DD_PRODUCT_TYPE" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_TYPE_NAME en Dev"; exit 1; }
+          [ -n "$DD_PRODUCT" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_NAME en Dev"; exit 1; }
+          [ -n "$DD_ENGAGEMENT" ] || { echo "::error::Falta DEFECTDOJO_ENGAGEMENT_NAME en Dev"; exit 1; }
+
+          BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          echo "Enviando Grype: $DD_PRODUCT / $DD_ENGAGEMENT / $BRANCH"
+
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            "${DD_URL%/}/api/v2/reimport-scan/" \
+            --header "Authorization: Token $DD_TOKEN" \
+            --form "scan_type=Anchore Grype" \
+            --form "product_type_name=$DD_PRODUCT_TYPE" \
+            --form "product_name=$DD_PRODUCT" \
+            --form "engagement_name=$DD_ENGAGEMENT" \
+            --form "test_title=Grype $BRANCH" \
+            --form "auto_create_context=true" \
+            --form "branch_tag=$BRANCH" \
+            --form "commit_hash=$DD_COMMIT" \
+            --form "file=@$REPORT;type=application/json"
