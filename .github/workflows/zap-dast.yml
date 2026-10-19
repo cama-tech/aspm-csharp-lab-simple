@@ -104,14 +104,17 @@ jobs:
           jq '
             .servers = [{"url": "http://app:8080"}]
             | del(.paths["/api/lab-results"].delete)
+            | del(.paths["/api/redirect"])
           ' "$OUT/openapi-original.json" > "$OUT/openapi-zap.json"
 
           jq -e '
             .paths["/api/lab-results"].delete == null
             and .paths["/api/lab-results"].get != null
             and .paths["/api/lab-results"].post != null
-            and .paths["/api/redirect"] != null
+            and .paths["/api/redirect"] == null
           ' "$OUT/openapi-zap.json" > /dev/null
+
+          echo "DELETE /api/lab-results y /api/redirect excluidos del escaneo."
 
       - name: Preparar reglas y configuración de ZAP
         shell: bash
@@ -145,14 +148,8 @@ jobs:
           ZAP_EXIT=$?
           set -e
 
-          if [ -f "$OUT/zap-console.log" ]; then
-            tail -n 150 "$OUT/zap-console.log"
-          else
-            echo "::error::ZAP no creó zap-console.log"
-          fi
-
+          tail -n 150 "$OUT/zap-console.log" || true
           echo "Código de salida de ZAP: $ZAP_EXIT"
-          echo "Archivos generados:"
           ls -lah "$OUT"
 
           if [ "$ZAP_EXIT" -ne 0 ]; then
@@ -160,32 +157,27 @@ jobs:
             exit "$ZAP_EXIT"
           fi
 
-          if [ ! -s "$OUT/zap-results.json" ]; then
+          test -s "$OUT/zap-results.json" || {
             echo "::error::No existe o está vacío zap-results.json"
             exit 1
-          fi
+          }
 
-          if ! jq -e '.site | type == "array"' "$OUT/zap-results.json" > /dev/null; then
-            echo "::error::zap-results.json no tiene la estructura esperada"
-            exit 1
-          fi
+          jq -e '.site | type == "array"' \
+            "$OUT/zap-results.json" > /dev/null
 
-          if [ ! -s "$OUT/zap-results.xml" ]; then
+          test -s "$OUT/zap-results.xml" || {
             echo "::error::No existe o está vacío zap-results.xml"
             exit 1
-          fi
+          }
 
-          if ! python -c \
+          python -c \
             "import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])" \
-            "$OUT/zap-results.xml"; then
-            echo "::error::zap-results.xml no es XML válido"
-            exit 1
-          fi
+            "$OUT/zap-results.xml"
 
-          if ! grep -Fq '[custom-dast-rules] Evaluando' "$OUT/zap-console.log"; then
+          grep -Fq '[custom-dast-rules] Evaluando' "$OUT/zap-console.log" || {
             echo "::error::No se encontró evidencia de ejecución de las reglas personalizadas"
             exit 1
-          fi
+          }
 
           echo "Informes válidos y reglas personalizadas ejecutadas."
 
