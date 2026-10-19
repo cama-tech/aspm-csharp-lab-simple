@@ -33,8 +33,6 @@ jobs:
   - type: activeScan
     parameters:
       context: aspm-lab
-      # El script activo se registra y habilita en los jobs anteriores.
-      # No se fuerza el ID 100101 en la politica de reglas.
 
   - type: report
     parameters:
@@ -45,14 +43,17 @@ jobs:
 
   - type: report
     parameters:
-      template: traditional-html
+      template: traditional-xml
       reportDir: /zap/wrk
-      reportFile: zap-report.html
+      reportFile: zap-results.xml
       reportTitle: ASPM DAST Report
-
-  - type: report
-    parameters:
-      template: sarif-json
-      reportDir: /zap/wrk
-      reportFile: zap-report.sarif.json
-      reportTitle: ASPM DAST SARIF Report
+    risks:
+      - high
+      - medium
+      - low
+      - info
+    confidences:
+      - high
+      - medium
+      - low
+      - falsepositive
