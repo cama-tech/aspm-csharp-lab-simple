@@ -1,0 +1,110 @@
+name: IaC Checkov
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, prueba-codeql]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  iac:
+    name: Checkov - Infrastructure as Code
+    runs-on: ubuntu-latest
+    environment: Dev
+
+    steps:
+      - name: Obtener código
+        uses: actions/checkout@v4
+
+      - name: Preparar resultados
+        run: mkdir -p "$RUNNER_TEMP/checkov-results"
+
+      - name: Ejecutar Checkov
+        shell: bash
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            -v "$RUNNER_TEMP/checkov-results:/results" \
+            bridgecrew/checkov:latest \
+            --directory /repo \
+            --output json \
+            --output-file-path /results \
+            --soft-fail
+
+      - name: Verificar resultado
+        shell: bash
+        run: |
+          REPORT="$RUNNER_TEMP/checkov-results/results_json.json"
+
+          ls -lah "$RUNNER_TEMP/checkov-results"
+          test -s "$REPORT"
+          jq -e . "$REPORT" > /dev/null
+
+      - name: Mostrar hallazgos
+        shell: bash
+        run: |
+          jq -r '
+            (if type == "array" then .[] else . end)
+            | .results.failed_checks[]?
+            | [
+                .check_id,
+                .check_name,
+                .file_path,
+                (.file_line_range // [] | tostring)
+              ]
+            | @tsv
+          ' "$RUNNER_TEMP/checkov-results/results_json.json"
+
+      - name: Guardar informe como artefacto
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aspm-iac-checkov-results
+          path: ${{ runner.temp }}/checkov-results/results_json.json
+          if-no-files-found: warn
+
+      - name: Enviar resultados a DefectDojo
+        if: >-
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          DD_URL: ${{ secrets.DEFECTDOJO_URL }}
+          DD_TOKEN: ${{ secrets.DEFECTDOJO_API_TOKEN }}
+          DD_PRODUCT_TYPE: ${{ secrets.DEFECTDOJO_PRODUCT_TYPE_NAME }}
+          DD_PRODUCT: ${{ secrets.DEFECTDOJO_PRODUCT_NAME }}
+          DD_ENGAGEMENT: ${{ secrets.DEFECTDOJO_ENGAGEMENT_NAME }}
+          DD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          REPORT="$RUNNER_TEMP/checkov-results/results_json.json"
+
+          test -s "$REPORT" || {
+            echo "::error::No se generó results_json.json"
+            exit 1
+          }
+          [ -n "$DD_URL" ] || { echo "::error::Falta DEFECTDOJO_URL en Dev"; exit 1; }
+          [ -n "$DD_TOKEN" ] || { echo "::error::Falta DEFECTDOJO_API_TOKEN en Dev"; exit 1; }
+          [ -n "$DD_PRODUCT_TYPE" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_TYPE_NAME en Dev"; exit 1; }
+          [ -n "$DD_PRODUCT" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_NAME en Dev"; exit 1; }
+          [ -n "$DD_ENGAGEMENT" ] || { echo "::error::Falta DEFECTDOJO_ENGAGEMENT_NAME en Dev"; exit 1; }
+
+          BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          echo "Enviando Checkov: $DD_PRODUCT / $DD_ENGAGEMENT / $BRANCH"
+
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            "${DD_URL%/}/api/v2/reimport-scan/" \
+            --header "Authorization: Token $DD_TOKEN" \
+            --form "scan_type=Checkov Scan" \
+            --form "product_type_name=$DD_PRODUCT_TYPE" \
+            --form "product_name=$DD_PRODUCT" \
+            --form "engagement_name=$DD_ENGAGEMENT" \
+            --form "test_title=Checkov $BRANCH" \
+            --form "auto_create_context=true" \
+            --form "branch_tag=$BRANCH" \
+            --form "commit_hash=$DD_COMMIT" \
+            --form "file=@$REPORT;type=application/json"
