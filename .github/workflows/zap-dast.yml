@@ -32,7 +32,7 @@ jobs:
 
           FILE=$(find . -type f -name Dockerfile \
             -not -path './.git/*' \
-            | sort | head -n 1)
+            | sort | sed -n '1p')
 
           if [ -z "$FILE" ]; then
             echo "::error::No se encontró un Dockerfile para iniciar la aplicación."
@@ -102,13 +102,15 @@ jobs:
             "$OUT/openapi-original.json" > /dev/null
 
           jq '
-            del(.paths["/api/lab-results"].delete, .paths["/api/redirect"])
+            .servers = [{"url": "http://app:8080"}]
+            | del(.paths["/api/lab-results"].delete)
           ' "$OUT/openapi-original.json" > "$OUT/openapi-zap.json"
 
           jq -e '
             .paths["/api/lab-results"].delete == null
             and .paths["/api/lab-results"].get != null
             and .paths["/api/lab-results"].post != null
+            and .paths["/api/redirect"] != null
           ' "$OUT/openapi-zap.json" > /dev/null
 
       - name: Preparar reglas y configuración de ZAP
@@ -143,10 +145,12 @@ jobs:
           tail -n 100 "$OUT/zap-console.log"
 
           test -s "$OUT/zap-results.json"
-          test -s "$OUT/zap-report.html"
-
-          # ZAP debe producir el JSON tradicional que importa DefectDojo.
           jq -e '.site | type == "array"' "$OUT/zap-results.json" > /dev/null
+
+          test -s "$OUT/zap-results.xml"
+          python -c \
+            "import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])" \
+            "$OUT/zap-results.xml"
 
           grep -Fq '[custom-dast-rules] Evaluando' "$OUT/zap-console.log" || {
             echo "::error::No se encontró evidencia de ejecución de las reglas personalizadas."
@@ -160,6 +164,7 @@ jobs:
           name: aspm-dast-zap-results
           path: |
             ${{ runner.temp }}/dast-results/zap-results.json
+            ${{ runner.temp }}/dast-results/zap-results.xml
             ${{ runner.temp }}/dast-results/zap-report.html
             ${{ runner.temp }}/dast-results/zap-console.log
           if-no-files-found: warn
@@ -180,14 +185,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          REPORT="$RUNNER_TEMP/dast-results/zap-results.json"
+          REPORT="$RUNNER_TEMP/dast-results/zap-results.xml"
 
           test -s "$REPORT" || {
-            echo "::error::No se generó zap-results.json"
+            echo "::error::No se generó zap-results.xml"
             exit 1
           }
 
-          jq -e '.site | type == "array"' "$REPORT" > /dev/null
+          python -c \
+            "import sys, xml.etree.ElementTree as ET; ET.parse(sys.argv[1])" \
+            "$REPORT"
 
           [ -n "$DD_URL" ] || { echo "::error::Falta DEFECTDOJO_URL en Dev"; exit 1; }
           [ -n "$DD_TOKEN" ] || { echo "::error::Falta DEFECTDOJO_API_TOKEN en Dev"; exit 1; }
@@ -210,7 +217,7 @@ jobs:
             --form "auto_create_context=true" \
             --form "branch_tag=$BRANCH" \
             --form "commit_hash=$DD_COMMIT" \
-            --form "file=@$REPORT;type=application/json"
+            --form "file=@$REPORT;type=application/xml"
 
       - name: Mostrar logs si falla
         if: failure()
