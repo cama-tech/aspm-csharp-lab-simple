@@ -39,6 +39,48 @@ jobs:
             --json-output=semgrep.json \
             aspm-csharp-lab-simple/src/AspmLab
 
+      - name: Mostrar hallazgos de Semgrep en el PR
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = Path("semgrep.json")
+          if not report.is_file():
+              print("No se encontró semgrep.json; no hay anotaciones que publicar.")
+              raise SystemExit(0)
+
+          def escape(value):
+              return (
+                  str(value)
+                  .replace("%", "%25")
+                  .replace("\r", "%0D")
+                  .replace("\n", "%0A")
+                  .replace(":", "%3A")
+                  .replace(",", "%2C")
+              )
+
+          data = json.loads(report.read_text(encoding="utf-8"))
+
+          for finding in data.get("results", []):
+              extra = finding.get("extra", {})
+              severity = extra.get("severity", "WARNING").upper()
+              level = {
+                  "ERROR": "error",
+                  "WARNING": "warning",
+                  "INFO": "notice",
+              }.get(severity, "warning")
+
+              path = escape(finding.get("path", ""))
+              line = finding.get("start", {}).get("line", 1)
+              rule = escape(finding.get("check_id", "Semgrep"))
+              message = escape(extra.get("message", "Hallazgo de Semgrep"))
+
+              print(f"::{level} file={path},line={line},title={rule}::{message}")
+          PY
+
       - name: Save reports
         uses: actions/upload-artifact@v4
         with:
