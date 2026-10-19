@@ -1,4 +1,4 @@
-name: ASPM - DAST OWASP ZAP
+name: DAST OWASP ZAP
 
 on:
   workflow_dispatch:
@@ -165,7 +165,6 @@ jobs:
           path: |
             ${{ runner.temp }}/dast-results/zap-results.json
             ${{ runner.temp }}/dast-results/zap-results.xml
-            ${{ runner.temp }}/dast-results/zap-report.html
             ${{ runner.temp }}/dast-results/zap-console.log
           if-no-files-found: warn
           retention-days: 7
