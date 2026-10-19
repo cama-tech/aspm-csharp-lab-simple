@@ -1,0 +1,58 @@
+env:
+  contexts:
+    - name: aspm-lab
+      urls:
+        - http://app:8080
+      includePaths:
+        - http://app:8080.*
+  parameters:
+    failOnError: true
+    progressToStdout: true
+
+jobs:
+  - type: openapi
+    parameters:
+      apiFile: /zap/wrk/openapi-zap.json
+      targetUrl: http://app:8080
+      context: aspm-lab
+
+  - type: script
+    parameters:
+      action: add
+      type: active
+      engine: "ECMAScript : GraalVM JavaScript"
+      name: custom-dast-rules
+      file: /zap/wrk/scripts/custom-dast-rules.js
+
+  - type: script
+    parameters:
+      action: enable
+      type: active
+      name: custom-dast-rules
+
+  - type: activeScan
+    parameters:
+      context: aspm-lab
+      # El script activo se registra y habilita en los jobs anteriores.
+      # No se fuerza el ID 100101 en la politica de reglas.
+
+  - type: report
+    parameters:
+      template: traditional-json
+      reportDir: /zap/wrk
+      reportFile: zap-results.json
+      reportTitle: ASPM DAST Report
+
+  - type: report
+    parameters:
+      template: traditional-html
+      reportDir: /zap/wrk
+      reportFile: zap-report.html
+      reportTitle: ASPM DAST Report
+
+  - type: report
+    parameters:
+      template: sarif-json
+      reportDir: /zap/wrk
+      reportFile: zap-report.sarif.json
+      reportTitle: ASPM DAST SARIF Report
