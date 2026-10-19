@@ -1,0 +1,29 @@
+title = "ASPM controlled secrets laboratory"
+
+[[rules]]
+id = "lab-aws-access-key"
+description = "Synthetic AWS-shaped access key used only by this laboratory"
+regex = '''ASPM_LAB_AWS_[A-Z0-9]{16,20}'''
+tags = ["lab", "aws", "critical"]
+
+[[rules]]
+id = "lab-github-token"
+description = "Synthetic GitHub-shaped token used only by this laboratory"
+regex = '''ghp_LAB[A-Za-z0-9]{20,40}'''
+tags = ["lab", "github", "high"]
+
+[[rules]]
+id = "lab-password"
+description = "Synthetic password used only by this laboratory"
+regex = '''LAB_PASSWORD=[A-Za-z0-9!@#$%^&*]{12,}'''
+tags = ["lab", "password", "medium"]
+
+[[rules]]
+id = "lab-internal-key"
+description = "Synthetic low-confidence internal key used only by this laboratory"
+regex = '''LAB_INTERNAL_KEY=test-key-[0-9]{5}'''
+tags = ["lab", "generic", "low"]
+
+[allowlist]
+description = "Known false-positive and public example identifiers"
+paths = ['''fixtures/secrets/known-false-positives.txt''']
