@@ -1,0 +1,193 @@
+name: Contenedores Trivy
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, prueba-codeql]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  container:
+    name: Trivy - Contenedor y Dockerfile
+    runs-on: ubuntu-latest
+    environment: Dev
+
+    steps:
+      - name: Obtener código
+        uses: actions/checkout@v4
+
+      - name: Preparar resultados
+        run: mkdir -p "$RUNNER_TEMP/trivy-results"
+
+      - name: Buscar y construir imagen Docker
+        id: docker_build
+        shell: bash
+        run: |
+          DOCKERFILE=$(find . -type f -name Dockerfile \
+            -not -path './.git/*' \
+            | sort | head -n 1)
+
+          if [ -z "$DOCKERFILE" ]; then
+            echo "::error::No se encontró un Dockerfile; no se pueden generar los dos informes."
+            exit 1
+          fi
+
+          echo "Dockerfile encontrado: $DOCKERFILE"
+          echo "dockerfile_path=$DOCKERFILE" >> "$GITHUB_OUTPUT"
+
+          CONTEXT=$(dirname "$DOCKERFILE")
+
+          docker build \
+            -t aspm-lab-docker-app:local \
+            -f "$DOCKERFILE" \
+            "$CONTEXT"
+
+          echo "image_built=true" >> "$GITHUB_OUTPUT"
+
+      - name: Analizar contenedor con Trivy
+        if: steps.docker_build.outputs.image_built == 'true'
+        shell: bash
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$RUNNER_TEMP/trivy-results:/results" \
+            aquasec/trivy:latest \
+            image \
+            --scanners vuln \
+            --format json \
+            --output /results/trivy-image-results.json \
+            aspm-lab-docker-app:local
+
+      - name: Analizar Dockerfile con Trivy
+        if: steps.docker_build.outputs.image_built == 'true'
+        shell: bash
+        env:
+          DOCKERFILE: ${{ steps.docker_build.outputs.dockerfile_path }}
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/repo:ro" \
+            -v "$RUNNER_TEMP/trivy-results:/results" \
+            aquasec/trivy:latest \
+            config \
+            --format json \
+            --output /results/trivy-dockerfile-results.json \
+            "/repo/$DOCKERFILE"
+
+      - name: Verificar informes
+        if: steps.docker_build.outputs.image_built == 'true'
+        shell: bash
+        run: |
+          for file in \
+            trivy-image-results.json \
+            trivy-dockerfile-results.json
+          do
+            REPORT="$RUNNER_TEMP/trivy-results/$file"
+            test -s "$REPORT"
+            jq -e . "$REPORT" > /dev/null
+            echo "Informe válido: $file"
+          done
+
+      - name: Mostrar hallazgos del contenedor
+        if: steps.docker_build.outputs.image_built == 'true'
+        shell: bash
+        run: |
+          jq -r '
+            .Results[]?
+            | .Target as $target
+            | .Vulnerabilities[]?
+            | [
+                .VulnerabilityID,
+                .PkgName,
+                .InstalledVersion,
+                .Severity,
+                $target
+              ]
+            | @tsv
+          ' "$RUNNER_TEMP/trivy-results/trivy-image-results.json"
+
+      - name: Mostrar hallazgos del Dockerfile
+        if: steps.docker_build.outputs.image_built == 'true'
+        shell: bash
+        run: |
+          jq -r '
+            .Results[]?
+            | .Target as $target
+            | .Misconfigurations[]?
+            | [
+                .ID,
+                .Title,
+                .Severity,
+                $target,
+                (.CauseMetadata.StartLine // "" | tostring)
+              ]
+            | @tsv
+          ' "$RUNNER_TEMP/trivy-results/trivy-dockerfile-results.json"
+
+      - name: Guardar informes como artefacto
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aspm-container-trivy-results
+          path: ${{ runner.temp }}/trivy-results/
+          if-no-files-found: warn
+
+      - name: Enviar los dos informes a DefectDojo
+        if: >-
+          steps.docker_build.outputs.image_built == 'true' &&
+          (github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          DD_URL: ${{ secrets.DEFECTDOJO_URL }}
+          DD_TOKEN: ${{ secrets.DEFECTDOJO_API_TOKEN }}
+          DD_PRODUCT_TYPE: ${{ secrets.DEFECTDOJO_PRODUCT_TYPE_NAME }}
+          DD_PRODUCT: ${{ secrets.DEFECTDOJO_PRODUCT_NAME }}
+          DD_ENGAGEMENT: ${{ secrets.DEFECTDOJO_ENGAGEMENT_NAME }}
+          DD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        shell: bash
+        run: |
+          [ -n "$DD_URL" ] || { echo "::error::Falta DEFECTDOJO_URL en Dev"; exit 1; }
+          [ -n "$DD_TOKEN" ] || { echo "::error::Falta DEFECTDOJO_API_TOKEN en Dev"; exit 1; }
+          [ -n "$DD_PRODUCT_TYPE" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_TYPE_NAME en Dev"; exit 1; }
+          [ -n "$DD_PRODUCT" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_NAME en Dev"; exit 1; }
+          [ -n "$DD_ENGAGEMENT" ] || { echo "::error::Falta DEFECTDOJO_ENGAGEMENT_NAME en Dev"; exit 1; }
+
+          BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          API_URL="${DD_URL%/}/api/v2/reimport-scan/"
+
+          send_to_defectdojo() {
+            local report="$1"
+            local title="$2"
+
+            test -s "$report" || {
+              echo "::error::No se encontró el informe: $report"
+              return 1
+            }
+
+            echo "Enviando a DefectDojo: $title"
+
+            curl --fail-with-body --silent --show-error \
+              --request POST \
+              "$API_URL" \
+              --header "Authorization: Token $DD_TOKEN" \
+              --form "scan_type=Trivy Scan" \
+              --form "product_type_name=$DD_PRODUCT_TYPE" \
+              --form "product_name=$DD_PRODUCT" \
+              --form "engagement_name=$DD_ENGAGEMENT" \
+              --form "test_title=$title" \
+              --form "auto_create_context=true" \
+              --form "branch_tag=$BRANCH" \
+              --form "commit_hash=$DD_COMMIT" \
+              --form "file=@$report;type=application/json"
+          }
+
+          send_to_defectdojo \
+            "$RUNNER_TEMP/trivy-results/trivy-image-results.json" \
+            "Trivy Contenedores $BRANCH"
+
+          send_to_defectdojo \
+            "$RUNNER_TEMP/trivy-results/trivy-dockerfile-results.json" \
+            "Trivy Dockerfile $BRANCH"
