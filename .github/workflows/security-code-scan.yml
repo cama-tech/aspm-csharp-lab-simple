@@ -1,0 +1,141 @@
+name: Security Code Scan
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    environment: Dev
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install SecurityCodeScan
+        run: |
+          dotnet add \
+            aspm-csharp-lab-simple/src/AspmLab/AspmLab.csproj \
+            package SecurityCodeScan.VS2019 \
+            --version 5.6.7
+
+      - name: Record package version and commit
+        run: |
+          echo "Commit: $GITHUB_SHA"
+          dotnet list \
+            aspm-csharp-lab-simple/src/AspmLab/AspmLab.csproj \
+            package
+
+      - name: Build and analyze
+        run: |
+          mkdir -p scs-results
+          dotnet build \
+            aspm-csharp-lab-simple/src/AspmLab/AspmLab.csproj \
+            --configuration Release \
+            --no-incremental \
+            -p:RunAnalyzersDuringBuild=true \
+            -p:ErrorLog="$GITHUB_WORKSPACE/scs-results/security-code-scan.sarif%2Cversion=2.1"
+
+      - name: Keep SecurityCodeScan findings
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+
+          path = Path("scs-results/security-code-scan.sarif")
+          report = json.loads(path.read_text(encoding="utf-8"))
+
+          total = 0
+          for run in report.get("runs", []):
+              driver = run.setdefault("tool", {}).setdefault("driver", {})
+              driver["name"] = "Security Code Scan"
+
+              run["results"] = [
+                  finding
+                  for finding in run.get("results", [])
+                  if str(finding.get("ruleId", "")).startswith("SCS")
+              ]
+              total += len(run["results"])
+
+          path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+          print(f"Hallazgos SecurityCodeScan conservados: {total}")
+
+      - name: Save SARIF
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-code-scan-report
+          path: scs-results/security-code-scan.sarif
+          if-no-files-found: warn
+
+      - name: Publish results in GitHub
+        if: always() && hashFiles('scs-results/security-code-scan.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: scs-results/security-code-scan.sarif
+          category: security-code-scan-csharp
+
+      - name: Send results to DefectDojo
+        if: github.event_name != 'pull_request'
+        env:
+          DD_URL: ${{ secrets.DEFECTDOJO_URL }}
+          DD_TOKEN: ${{ secrets.DEFECTDOJO_API_TOKEN }}
+          DD_PRODUCT_TYPE: ${{ secrets.DEFECTDOJO_PRODUCT_TYPE_NAME }}
+          DD_PRODUCT: ${{ secrets.DEFECTDOJO_PRODUCT_NAME }}
+          DD_ENGAGEMENT: ${{ secrets.DEFECTDOJO_ENGAGEMENT_NAME }}
+        run: |
+          test -s scs-results/security-code-scan.sarif || {
+            echo "::error::No se generó el archivo SARIF"
+            exit 1
+          }
+
+          [ -n "$DD_URL" ] || {
+            echo "::error::Falta DEFECTDOJO_URL en el entorno Dev"
+            exit 1
+          }
+          [ -n "$DD_TOKEN" ] || {
+            echo "::error::Falta DEFECTDOJO_API_TOKEN en el entorno Dev"
+            exit 1
+          }
+          [ -n "$DD_PRODUCT_TYPE" ] || {
+            echo "::error::Falta DEFECTDOJO_PRODUCT_TYPE_NAME en el entorno Dev"
+            exit 1
+          }
+          [ -n "$DD_PRODUCT" ] || {
+            echo "::error::Falta DEFECTDOJO_PRODUCT_NAME en el entorno Dev"
+            exit 1
+          }
+          [ -n "$DD_ENGAGEMENT" ] || {
+            echo "::error::Falta DEFECTDOJO_ENGAGEMENT_NAME en el entorno Dev"
+            exit 1
+          }
+
+          BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
+          echo "Enviando Security Code Scan: $DD_PRODUCT / $DD_ENGAGEMENT / $BRANCH"
+
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            "${DD_URL%/}/api/v2/reimport-scan/" \
+            --header "Authorization: Token $DD_TOKEN" \
+            --form "scan_type=SARIF" \
+            --form "product_type_name=$DD_PRODUCT_TYPE" \
+            --form "product_name=$DD_PRODUCT" \
+            --form "engagement_name=$DD_ENGAGEMENT" \
+            --form "test_title=Security Code Scan $BRANCH" \
+            --form "auto_create_context=true" \
+            --form "branch_tag=$BRANCH" \
+            --form "commit_hash=$GITHUB_SHA" \
+            --form "file=@scs-results/security-code-scan.sarif;type=application/sarif+json"
