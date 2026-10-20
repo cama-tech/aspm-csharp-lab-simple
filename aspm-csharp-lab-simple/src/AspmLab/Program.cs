@@ -415,7 +415,7 @@ app.MapGet("/api/test-xss-3", (string? q) =>
 {
     var html = $"<html><body>Search result: {q}</body></html>";
     return Results.Content(html, "text/html");
-})
+});
 
 // BASELINE-SAST-002: unvalidated redirect.
 app.MapGet("/api/redirect", (string? url) => Results.Redirect(url ?? "/"));
