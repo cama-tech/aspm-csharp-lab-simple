@@ -22,6 +22,8 @@ resource "aws_s3_bucket_public_access_block" "aspm_lab" {
   restrict_public_buckets = false
 }
 
+
+
 # LAB-IAC-CRITICAL-001: database port exposed to the Internet.
 resource "aws_security_group" "database" {
   name = "aspm-lab-database"
