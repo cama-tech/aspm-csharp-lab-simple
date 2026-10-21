@@ -10,6 +10,7 @@ on:
 permissions:
   contents: read
   security-events: write
+  actions: read
 
 jobs:
   analyze:
@@ -19,6 +20,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/head', github.event.pull_request.number) || github.sha }}
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v4
@@ -26,105 +30,449 @@ jobs:
           dotnet-version: '8.0.x'
 
       - name: Install SecurityCodeScan
+        shell: bash
         run: |
+          set -euo pipefail
+
           dotnet add \
             aspm-csharp-lab-simple/src/AspmLab/AspmLab.csproj \
             package SecurityCodeScan.VS2019 \
             --version 5.6.7
 
-      - name: Record package version and commit
+      - name: Record package version and analyzed commit
+        shell: bash
         run: |
-          echo "Commit: $GITHUB_SHA"
+          set -euo pipefail
+
+          echo "Commit analizado: $(git rev-parse HEAD)"
           dotnet list \
             aspm-csharp-lab-simple/src/AspmLab/AspmLab.csproj \
             package
 
       - name: Build and analyze
+        shell: bash
         run: |
+          set -euo pipefail
+
           mkdir -p scs-results
+
           dotnet build \
             aspm-csharp-lab-simple/src/AspmLab/AspmLab.csproj \
             --configuration Release \
             --no-incremental \
             -p:RunAnalyzersDuringBuild=true \
-            -p:ErrorLog="$GITHUB_WORKSPACE/scs-results/security-code-scan.sarif%2Cversion=2.1"
+            -p:ErrorLog="$GITHUB_WORKSPACE/scs-results/security-code-scan.sarif%2Cversion=2.1" \
+            2>&1 | tee scs-results/build.log
 
-      - name: Keep SecurityCodeScan findings
-        shell: python
+      - name: Keep SecurityCodeScan findings and filter PR changes
+        id: scan
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
+          set -euo pipefail
+
+          REPORT="scs-results/security-code-scan.sarif"
+          BUILD_LOG="scs-results/build.log"
+
+          test -s "$REPORT" || {
+            echo "::error::No se generó el archivo SARIF."
+            exit 1
+          }
+
+          python3 - "$REPORT" "$BUILD_LOG" "$EVENT_NAME" "$BASE_SHA" "$HEAD_SHA" "$GITHUB_WORKSPACE" <<'PY'
           import json
-          from pathlib import Path
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path, PurePosixPath
+          from urllib.parse import unquote, urlparse
 
-          path = Path("scs-results/security-code-scan.sarif")
-          report = json.loads(path.read_text(encoding="utf-8"))
+          report_path, build_log, event_name, base_sha, head_sha, workspace = sys.argv[1:7]
+          workspace_path = Path(workspace).resolve()
+          hunk_pattern = re.compile(
+              r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@"
+          )
 
-          total = 0
-          for run in report.get("runs", []):
+          def fail(message):
+              print(f"::error::{message}", file=sys.stderr)
+              raise SystemExit(1)
+
+          build_output = Path(build_log).read_text(
+              encoding="utf-8", errors="replace"
+          )
+
+          scs_ad0001 = any(
+              "AD0001" in line and "securitycodescan" in line.casefold()
+              for line in build_output.splitlines()
+          )
+
+          if scs_ad0001:
+              fail(
+                  "Security Code Scan reportó AD0001 "
+                  "(excepción del analizador). Revisa build.log."
+              )
+
+          def git_output(*args):
+              return subprocess.check_output(["git", *args])
+
+          changed_set = set()
+          changed_ranges = {}
+
+          if event_name == "pull_request":
+              if not base_sha or not head_sha:
+                  fail("No se recibieron los SHA base y head del PR.")
+
+              changed_raw = git_output(
+                  "diff",
+                  "--name-only",
+                  "--diff-filter=ACMRT",
+                  "-z",
+                  f"{base_sha}...{head_sha}",
+              )
+
+              changed_files = [
+                  path.decode("utf-8", errors="surrogateescape")
+                  for path in changed_raw.split(b"\0")
+                  if path
+              ]
+              changed_set = set(changed_files)
+
+              for file_path in changed_files:
+                  diff = git_output(
+                      "-c",
+                      "core.quotepath=false",
+                      "diff",
+                      "--unified=0",
+                      "--no-color",
+                      f"{base_sha}...{head_sha}",
+                      "--",
+                      file_path,
+                  ).decode("utf-8", errors="replace")
+
+                  for line in diff.splitlines():
+                      match = hunk_pattern.match(line)
+                      if not match:
+                          continue
+
+                      start = int(match.group(1))
+                      count = int(match.group(2) or "1")
+
+                      if count > 0:
+                          changed_range = (start, start + count - 1)
+                      else:
+                          # La eliminación de una línea segura puede dejar
+                          # inseguro el código que permanece.
+                          adjacent_start = max(start, 1)
+                          changed_range = (adjacent_start, adjacent_start + 1)
+
+                      changed_ranges.setdefault(file_path, []).append(changed_range)
+
+          def normalize_path(value):
+              value = str(value or "").replace("\\", "/")
+
+              if value.startswith("file://"):
+                  value = unquote(urlparse(value).path)
+              else:
+                  value = unquote(value)
+
+              path = Path(value)
+              if path.is_absolute():
+                  try:
+                      value = path.resolve().relative_to(workspace_path).as_posix()
+                  except (ValueError, OSError):
+                      return None
+
+              if value.startswith("./"):
+                  value = value[2:]
+
+              return PurePosixPath(value).as_posix()
+
+          def overlaps_changed_code(path, start_line=None, end_line=None):
+              file_path = normalize_path(path)
+
+              if not file_path:
+                  return False
+
+              if event_name != "pull_request":
+                  return True
+
+              if file_path not in changed_set:
+                  return False
+
+              if (
+                  start_line is None
+                  or end_line is None
+                  or int(start_line) <= 0
+                  or int(end_line) < int(start_line)
+              ):
+                  # Sin rango válido, conserva el hallazgo si cambió el archivo.
+                  return True
+
+              start_line = int(start_line)
+              end_line = int(end_line)
+
+              return any(
+                  start_line <= changed_end and end_line >= changed_start
+                  for changed_start, changed_end
+                  in changed_ranges.get(file_path, [])
+              )
+
+          with open(report_path, encoding="utf-8") as sarif_file:
+              report = json.load(sarif_file)
+
+          runs = report.get("runs", [])
+          if not runs:
+              fail("El SARIF no contiene ejecuciones del analizador.")
+
+          # No se ignoran los resultados que contengan suppressions:
+          # las supresiones se revisan en code review.
+          for run in runs:
+              driver = run.get("tool", {}).get("driver", {})
+              driver_text = json.dumps(driver).casefold()
+
+              for finding in run.get("results", []):
+                  if str(finding.get("ruleId", "")).upper() != "AD0001":
+                      continue
+
+                  finding_text = json.dumps(finding).casefold()
+                  if (
+                      "securitycodescan" in finding_text
+                      or "securitycodescan" in driver_text
+                      or "security code scan" in driver_text
+                  ):
+                      fail(
+                          "El SARIF contiene AD0001 de Security Code Scan "
+                          "(excepción del analizador)."
+                      )
+
+          scs_before_filter = 0
+          scs_kept = 0
+
+          for run in runs:
               driver = run.setdefault("tool", {}).setdefault("driver", {})
               driver["name"] = "Security Code Scan"
 
-              run["results"] = [
-                  finding
-                  for finding in run.get("results", [])
-                  if str(finding.get("ruleId", "")).startswith("SCS")
-              ]
-              total += len(run["results"])
+              filtered_results = []
 
-          path.write_text(json.dumps(report, indent=2), encoding="utf-8")
-          print(f"Hallazgos SecurityCodeScan conservados: {total}")
+              for finding in run.get("results", []):
+                  if not str(finding.get("ruleId", "")).startswith("SCS"):
+                      continue
 
-      - name: Save SARIF
+                  scs_before_filter += 1
+                  locations = finding.get("locations", [])
+                  keep = event_name != "pull_request"
+
+                  for location in locations:
+                      physical = location.get("physicalLocation", {})
+                      artifact = physical.get("artifactLocation", {})
+                      region = physical.get("region", {})
+                      original_uri = artifact.get("uri", "")
+                      relative_path = normalize_path(original_uri)
+
+                      if relative_path:
+                          artifact["uri"] = relative_path
+
+                          if (
+                              original_uri.startswith("file://")
+                              or Path(original_uri).is_absolute()
+                          ):
+                              artifact.pop("uriBaseId", None)
+
+                      if overlaps_changed_code(
+                          relative_path,
+                          region.get("startLine"),
+                          region.get("endLine") or region.get("startLine"),
+                      ):
+                          keep = True
+                          break
+
+                  if keep:
+                      filtered_results.append(finding)
+                      scs_kept += 1
+
+              run["results"] = filtered_results
+
+          with open(report_path, "w", encoding="utf-8") as sarif_file:
+              json.dump(report, sarif_file, indent=2)
+              sarif_file.write("\n")
+
+          print(f"Archivos modificados en el PR: {len(changed_set)}")
+          print(f"Hallazgos SCS antes del filtro: {scs_before_filter}")
+          print(f"Hallazgos SCS conservados: {scs_kept}")
+          PY
+
+          FINDING_COUNT=$(python3 - "scs-results/security-code-scan.sarif" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as sarif_file:
+              report = json.load(sarif_file)
+
+          print(sum(
+              len(run.get("results", []))
+              for run in report.get("runs", [])
+          ))
+          PY
+          )
+
+          echo "finding_count=$FINDING_COUNT" >> "$GITHUB_OUTPUT"
+          echo "report_ready=true" >> "$GITHUB_OUTPUT"
+
+          if [ "$FINDING_COUNT" -gt 0 ]; then
+            echo "has_findings=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_findings=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Hallazgos SecurityCodeScan conservados: $FINDING_COUNT"
+
+      - name: Mostrar hallazgos como anotaciones en el PR
+        if: >-
+          always() &&
+          github.event_name == 'pull_request' &&
+          steps.scan.outputs.report_ready == 'true'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import PurePosixPath
+
+          report_path = PurePosixPath(
+              "scs-results/security-code-scan.sarif"
+          )
+
+          with open(str(report_path), encoding="utf-8") as sarif_file:
+              data = json.load(sarif_file)
+
+          def escape_data(value):
+              return (
+                  str(value)
+                  .replace("%", "%25")
+                  .replace("\r", "%0D")
+                  .replace("\n", "%0A")
+              )
+
+          def escape_property(value):
+              return (
+                  escape_data(value)
+                  .replace(":", "%3A")
+                  .replace(",", "%2C")
+              )
+
+          count = 0
+
+          for run in data.get("runs", []):
+              for finding in run.get("results", []):
+                  locations = finding.get("locations", [])
+                  if not locations:
+                      continue
+
+                  physical = locations[0].get("physicalLocation", {})
+                  artifact = physical.get("artifactLocation", {})
+                  region = physical.get("region", {})
+                  path = artifact.get("uri", "")
+                  start_line = region.get("startLine")
+
+                  if not path or not start_line:
+                      continue
+
+                  end_line = region.get("endLine")
+                  rule = finding.get("ruleId", "Security Code Scan")
+                  message_data = finding.get("message", {})
+
+                  if isinstance(message_data, str):
+                      message = message_data
+                  else:
+                      message = (
+                          message_data.get("text")
+                          or message_data.get("markdown")
+                          or rule
+                      )
+
+                  sarif_level = str(finding.get("level", "warning")).lower()
+                  level = {
+                      "error": "error",
+                      "warning": "warning",
+                      "note": "notice",
+                      "none": "notice",
+                  }.get(sarif_level, "warning")
+
+                  properties = (
+                      f"file={escape_property(path)},"
+                      f"line={start_line},"
+                      f"title={escape_property(rule)}"
+                  )
+
+                  if end_line and int(end_line) >= int(start_line):
+                      properties += f",endLine={end_line}"
+
+                  print(f"::{level} {properties}::{escape_data(message)}")
+                  count += 1
+
+          print(f"Anotaciones de Security Code Scan publicadas: {count}")
+          PY
+
+      - name: Save SARIF and build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: security-code-scan-report
-          path: scs-results/security-code-scan.sarif
+          path: |
+            scs-results/security-code-scan.sarif
+            scs-results/build.log
           if-no-files-found: warn
+          retention-days: 7
 
       - name: Publish results in GitHub
-        if: always() && hashFiles('scs-results/security-code-scan.sarif') != ''
+        if: >-
+          steps.scan.outputs.report_ready == 'true' &&
+          (
+            github.event_name != 'pull_request' ||
+            github.event.pull_request.head.repo.full_name == github.repository
+          )
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: scs-results/security-code-scan.sarif
           category: security-code-scan-csharp
+          ref: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/head', github.event.pull_request.number) || github.ref }}
+          sha: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - name: Send results to DefectDojo
-        if: github.event_name != 'pull_request'
+      - name: Send PR report to DefectDojo
+        if: >-
+          always() &&
+          github.event_name == 'pull_request' &&
+          steps.scan.outputs.report_ready == 'true' &&
+          github.event.pull_request.head.repo.full_name == github.repository
         env:
           DD_URL: ${{ secrets.DEFECTDOJO_URL }}
           DD_TOKEN: ${{ secrets.DEFECTDOJO_API_TOKEN }}
           DD_PRODUCT_TYPE: ${{ secrets.DEFECTDOJO_PRODUCT_TYPE_NAME }}
           DD_PRODUCT: ${{ secrets.DEFECTDOJO_PRODUCT_NAME }}
           DD_ENGAGEMENT: ${{ secrets.DEFECTDOJO_ENGAGEMENT_NAME }}
+          DD_COMMIT: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BRANCH: ${{ github.head_ref }}
+        shell: bash
         run: |
-          test -s scs-results/security-code-scan.sarif || {
-            echo "::error::No se generó el archivo SARIF"
+          set -euo pipefail
+
+          REPORT="scs-results/security-code-scan.sarif"
+
+          test -s "$REPORT" || {
+            echo "::error::No se generó el archivo SARIF."
             exit 1
           }
 
-          [ -n "$DD_URL" ] || {
-            echo "::error::Falta DEFECTDOJO_URL en el entorno Dev"
-            exit 1
-          }
-          [ -n "$DD_TOKEN" ] || {
-            echo "::error::Falta DEFECTDOJO_API_TOKEN en el entorno Dev"
-            exit 1
-          }
-          [ -n "$DD_PRODUCT_TYPE" ] || {
-            echo "::error::Falta DEFECTDOJO_PRODUCT_TYPE_NAME en el entorno Dev"
-            exit 1
-          }
-          [ -n "$DD_PRODUCT" ] || {
-            echo "::error::Falta DEFECTDOJO_PRODUCT_NAME en el entorno Dev"
-            exit 1
-          }
-          [ -n "$DD_ENGAGEMENT" ] || {
-            echo "::error::Falta DEFECTDOJO_ENGAGEMENT_NAME en el entorno Dev"
-            exit 1
-          }
+          [ -n "$DD_URL" ] || { echo "::error::Falta DEFECTDOJO_URL en Dev"; exit 1; }
+          [ -n "$DD_TOKEN" ] || { echo "::error::Falta DEFECTDOJO_API_TOKEN en Dev"; exit 1; }
+          [ -n "$DD_PRODUCT_TYPE" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_TYPE_NAME en Dev"; exit 1; }
+          [ -n "$DD_PRODUCT" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_NAME en Dev"; exit 1; }
+          [ -n "$DD_ENGAGEMENT" ] || { echo "::error::Falta DEFECTDOJO_ENGAGEMENT_NAME en Dev"; exit 1; }
 
-          BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
-          echo "Enviando Security Code Scan: $DD_PRODUCT / $DD_ENGAGEMENT / $BRANCH"
+          echo "Enviando Security Code Scan al Test del PR #$PR_NUMBER"
 
           curl --fail-with-body --silent --show-error \
             --request POST \
@@ -134,8 +482,22 @@ jobs:
             --form "product_type_name=$DD_PRODUCT_TYPE" \
             --form "product_name=$DD_PRODUCT" \
             --form "engagement_name=$DD_ENGAGEMENT" \
-            --form "test_title=Security Code Scan $BRANCH" \
+            --form "test_title=Security Code Scan PR #$PR_NUMBER" \
             --form "auto_create_context=true" \
-            --form "branch_tag=$BRANCH" \
-            --form "commit_hash=$GITHUB_SHA" \
-            --form "file=@scs-results/security-code-scan.sarif;type=application/sarif+json"
+            --form "close_old_findings=true" \
+            --form "branch_tag=$PR_BRANCH" \
+            --form "commit_hash=$DD_COMMIT" \
+            --form "file=@$REPORT;type=application/sarif+json"
+
+      - name: Fail PR if Security Code Scan found issues
+        if: >-
+          always() &&
+          github.event_name == 'pull_request' &&
+          steps.scan.outputs.report_ready == 'true' &&
+          steps.scan.outputs.has_findings == 'true'
+        shell: bash
+        env:
+          FINDING_COUNT: ${{ steps.scan.outputs.finding_count }}
+        run: |
+          echo "::error::Security Code Scan encontró $FINDING_COUNT hallazgo(s) asociados a cambios del PR."
+          exit 1
