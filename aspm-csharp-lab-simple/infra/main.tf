@@ -40,6 +40,15 @@ resource "aws_s3_bucket_policy" "aspm_lab_public" {
   })
 }
 
+# ============================================================
+# LAB-IAC-002: S3 bucket without explicit KMS encryption
+# Expected Checkov rule: CKV_AWS_145
+# ============================================================
+
+resource "aws_s3_bucket" "aspm_lab_unencrypted" {
+  bucket = "aspm-lab-unencrypted-never-deploy"
+}
+
 # LAB-IAC-CRITICAL-001: database port exposed to the Internet.
 resource "aws_security_group" "database" {
   name = "aspm-lab-database"
