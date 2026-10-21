@@ -22,6 +22,33 @@ resource "aws_s3_bucket_public_access_block" "aspm_lab" {
   restrict_public_buckets = false
 }
 
+# LAB-IAC-001: Allow anonymous public read access
+resource "aws_s3_bucket_policy" "aspm_lab_public" {
+  bucket = aws_s3_bucket.aspm_lab.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "PublicReadAccess"
+        Effect    = "Allow"
+        Principal = "*"
+        Action    = "s3:GetObject"
+        Resource  = "${aws_s3_bucket.aspm_lab.arn}/*"
+      }
+    ]
+  })
+}
+
+# ============================================================
+# LAB-IAC-002: S3 bucket without explicit KMS encryption
+# Expected Checkov rule: CKV_AWS_145
+# ============================================================
+
+resource "aws_s3_bucket" "aspm_lab_unencrypted" {
+  bucket = "aspm-lab-unencrypted-never-deploy"
+}
+
 
 # LAB-IAC-CRITICAL-001: database port exposed to the Internet.
 resource "aws_security_group" "database" {
