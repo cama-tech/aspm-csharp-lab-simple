@@ -417,20 +417,6 @@ app.MapGet("/api/test-xss-3", (string? q) =>
     return Results.Content(html, "text/html");
 });
 
-// PR-TEST-XSS-4: vulnerabilidad intencional para probar el análisis del PR.
-app.MapGet("/api/test-xss-4", (string? q) =>
-{
-    var html = $"<html><body>Search result: {q}</body></html>";
-    return Results.Content(html, "text/html");
-});
-
-// PR-TEST-XSS-5: vulnerabilidad intencional para probar el análisis del PR.
-app.MapGet("/api/test-xss-5", (string? q) =>
-{
-    var html = $"<html><body>Search result: {q}</body></html>";
-    return Results.Content(html, "text/html");
-});
-
 // BASELINE-SAST-002: unvalidated redirect.
 app.MapGet("/api/redirect", (string? url) => Results.Redirect(url ?? "/"));
 
