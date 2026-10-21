@@ -22,6 +22,14 @@ resource "aws_s3_bucket_public_access_block" "aspm_lab" {
   restrict_public_buckets = false
 }
 
+resource "aws_s3_bucket_public_access_block-1" "aspm_lab" {
+  bucket                  = aws_s3_bucket.aspm_lab.id
+  block_public_acls       = false
+  block_public_policy     = false
+  ignore_public_acls      = false
+  restrict_public_buckets = false
+}
+
 # LAB-IAC-CRITICAL-001: database port exposed to the Internet.
 resource "aws_security_group" "database" {
   name = "aspm-lab-database"
