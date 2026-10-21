@@ -20,47 +20,299 @@ jobs:
       image: semgrep/semgrep:latest
 
     steps:
+      - name: Install workflow dependencies
+        shell: sh
+        run: apk add --no-cache bash git curl
+
       - name: Checkout repository
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/head', github.event.pull_request.number) || github.sha }}
 
-      - name: Record scanner version and commit
+      - name: Mark checkout as safe for Git
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Prepare reports and rules
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/semgrep-results"
+
+          test -d aspm-csharp-lab-simple/src/AspmLab || {
+            echo "::error::No se encontró aspm-csharp-lab-simple/src/AspmLab."
+            exit 1
+          }
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            git cat-file -e "$BASE_SHA:.github/semgrep/aspm-rules.yml" || {
+              echo "::error::La rama base no contiene .github/semgrep/aspm-rules.yml."
+              exit 1
+            }
+
+            git show "$BASE_SHA:.github/semgrep/aspm-rules.yml" \
+              > "$RUNNER_TEMP/aspm-rules.yml"
+          else
+            test -s .github/semgrep/aspm-rules.yml || {
+              echo "::error::No se encontró .github/semgrep/aspm-rules.yml."
+              exit 1
+            }
+
+            cp .github/semgrep/aspm-rules.yml "$RUNNER_TEMP/aspm-rules.yml"
+          fi
+
+      - name: Run Semgrep and filter PR changes
+        id: scan
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          REPORT="$RUNNER_TEMP/semgrep-results/semgrep.json"
+          SARIF="$RUNNER_TEMP/semgrep-results/semgrep.sarif"
+
           semgrep --version
           echo "Commit: $GITHUB_SHA"
 
-      - name: Run Semgrep
-        run: |
-          test -f .github/semgrep/aspm-rules.yml
           semgrep scan \
             --config auto \
-            --config .github/semgrep/aspm-rules.yml \
+            --config "$RUNNER_TEMP/aspm-rules.yml" \
             --metrics=on \
-            --sarif-output=semgrep.sarif \
-            --json-output=semgrep.json \
+            --sarif-output="$SARIF" \
+            --json-output="$REPORT" \
             aspm-csharp-lab-simple/src/AspmLab
 
+          test -s "$REPORT" || {
+            echo "::error::Semgrep no generó semgrep.json."
+            exit 1
+          }
+
+          test -s "$SARIF" || {
+            echo "::error::Semgrep no generó semgrep.sarif."
+            exit 1
+          }
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ] || {
+              echo "::error::No se recibieron los SHA base y head del PR."
+              exit 1
+            }
+
+            python3 - "$REPORT" "$SARIF" "$BASE_SHA" "$HEAD_SHA" "$GITHUB_WORKSPACE" <<'PY'
+          import json
+          import re
+          import subprocess
+          import sys
+          from pathlib import Path, PurePosixPath
+          from urllib.parse import unquote, urlparse
+
+          report_path, sarif_path, base_sha, head_sha, workspace = sys.argv[1:6]
+          workspace_path = Path(workspace).resolve()
+          hunk_pattern = re.compile(
+              r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@"
+          )
+
+          def git_output(*args):
+              return subprocess.check_output(["git", *args])
+
+          changed_raw = git_output(
+              "diff",
+              "--name-only",
+              "--diff-filter=ACMRT",
+              "-z",
+              f"{base_sha}...{head_sha}",
+          )
+
+          changed_files = [
+              path.decode("utf-8", errors="surrogateescape")
+              for path in changed_raw.split(b"\0")
+              if path
+          ]
+          changed_set = set(changed_files)
+          changed_ranges = {}
+
+          for file_path in changed_files:
+              diff = git_output(
+                  "-c",
+                  "core.quotepath=false",
+                  "diff",
+                  "--unified=0",
+                  "--no-color",
+                  f"{base_sha}...{head_sha}",
+                  "--",
+                  file_path,
+              ).decode("utf-8", errors="replace")
+
+              for line in diff.splitlines():
+                  match = hunk_pattern.match(line)
+                  if not match:
+                      continue
+
+                  start = int(match.group(1))
+                  count = int(match.group(2) or "1")
+
+                  if count > 0:
+                      line_range = (start, start + count - 1)
+                  else:
+                      # Considera las líneas vecinas a una eliminación.
+                      adjacent_start = max(start, 1)
+                      line_range = (adjacent_start, adjacent_start + 1)
+
+                  changed_ranges.setdefault(file_path, []).append(line_range)
+
+          def normalize_path(value):
+              value = str(value or "").replace("\\", "/")
+
+              if value.startswith("file://"):
+                  value = unquote(urlparse(value).path)
+
+              path = Path(value)
+              if path.is_absolute():
+                  try:
+                      value = path.resolve().relative_to(workspace_path).as_posix()
+                  except (ValueError, OSError):
+                      value = value.lstrip("/")
+
+              return PurePosixPath(value.lstrip("/")).as_posix()
+
+          def overlaps(path, start=None, end=None):
+              path = normalize_path(path)
+
+              if path not in changed_set:
+                  return False
+
+              if start is None or end is None or start <= 0 or end < start:
+                  return True
+
+              return any(
+                  start <= changed_end and end >= changed_start
+                  for changed_start, changed_end in changed_ranges.get(path, [])
+              )
+
+          with open(report_path, encoding="utf-8") as report_file:
+              report = json.load(report_file)
+
+          original_count = len(report.get("results", []))
+          filtered_results = []
+
+          for finding in report.get("results", []):
+              start = finding.get("start", {}).get("line")
+              end = finding.get("end", {}).get("line") or start
+
+              if overlaps(finding.get("path"), start, end):
+                  filtered_results.append(finding)
+
+          report["results"] = filtered_results
+
+          with open(report_path, "w", encoding="utf-8") as report_file:
+              json.dump(report, report_file, indent=2)
+              report_file.write("\n")
+
+          with open(sarif_path, encoding="utf-8") as sarif_file:
+              sarif = json.load(sarif_file)
+
+          sarif_original_count = 0
+          sarif_kept_count = 0
+
+          for run in sarif.get("runs", []):
+              filtered_sarif_results = []
+
+              for result in run.get("results", []):
+                  sarif_original_count += 1
+                  keep = False
+
+                  for location in result.get("locations", []):
+                      physical = location.get("physicalLocation", {})
+                      artifact = physical.get("artifactLocation", {})
+                      uri = artifact.get("uri", "")
+                      region = physical.get("region", {})
+                      start = region.get("startLine")
+                      end = region.get("endLine") or start
+
+                      if overlaps(uri, start, end):
+                          keep = True
+                          break
+
+                  if keep:
+                      filtered_sarif_results.append(result)
+                      sarif_kept_count += 1
+
+              run["results"] = filtered_sarif_results
+
+          with open(sarif_path, "w", encoding="utf-8") as sarif_file:
+              json.dump(sarif, sarif_file, indent=2)
+              sarif_file.write("\n")
+
+          print(f"Archivos modificados en el PR: {len(changed_files)}")
+          print(f"Hallazgos JSON antes del filtro: {original_count}")
+          print(f"Hallazgos JSON asociados a cambios: {len(filtered_results)}")
+          print(f"Hallazgos SARIF antes del filtro: {sarif_original_count}")
+          print(f"Hallazgos SARIF asociados a cambios: {sarif_kept_count}")
+          PY
+          fi
+
+          FINDING_COUNT=$(python3 - "$REPORT" <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as report_file:
+              report = json.load(report_file)
+
+          print(len(report.get("results", [])))
+          PY
+          )
+
+          echo "finding_count=$FINDING_COUNT" >> "$GITHUB_OUTPUT"
+          echo "report_ready=true" >> "$GITHUB_OUTPUT"
+
+          if [ "$FINDING_COUNT" -gt 0 ]; then
+            echo "has_findings=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_findings=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Hallazgos en el alcance escaneado: $FINDING_COUNT"
+
       - name: Mostrar hallazgos de Semgrep en el PR
-        if: always()
+        if: >-
+          always() &&
+          github.event_name == 'pull_request' &&
+          steps.scan.outputs.report_ready == 'true'
         shell: bash
         run: |
-          python - <<'PY'
+          python3 - <<'PY'
           import json
+          import os
           from pathlib import Path
 
-          report = Path("semgrep.json")
+          report = (
+              Path(os.environ["RUNNER_TEMP"])
+              / "semgrep-results"
+              / "semgrep.json"
+          )
+
           if not report.is_file():
               print("No se encontró semgrep.json; no hay anotaciones que publicar.")
               raise SystemExit(0)
 
-          def escape(value):
+          def esc_data(value):
               return (
                   str(value)
                   .replace("%", "%25")
                   .replace("\r", "%0D")
                   .replace("\n", "%0A")
-                  .replace(":", "%3A")
-                  .replace(",", "%2C")
               )
+
+          def esc_prop(value):
+              return esc_data(value).replace(":", "%3A").replace(",", "%2C")
 
           data = json.loads(report.read_text(encoding="utf-8"))
 
@@ -73,41 +325,57 @@ jobs:
                   "INFO": "notice",
               }.get(severity, "warning")
 
-              path = escape(finding.get("path", ""))
+              path = esc_prop(finding.get("path", ""))
               line = finding.get("start", {}).get("line", 1)
-              rule = escape(finding.get("check_id", "Semgrep"))
-              message = escape(extra.get("message", "Hallazgo de Semgrep"))
+              rule = esc_prop(finding.get("check_id", "Semgrep"))
+              message = esc_data(extra.get("message", "Hallazgo de Semgrep"))
 
               print(f"::{level} file={path},line={line},title={rule}::{message}")
           PY
 
       - name: Save reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: semgrep-reports
           path: |
-            semgrep.sarif
-            semgrep.json
-          if-no-files-found: error
+            ${{ runner.temp }}/semgrep-results/semgrep.sarif
+            ${{ runner.temp }}/semgrep-results/semgrep.json
+          if-no-files-found: warn
+          retention-days: 7
 
-      - name: Send results to DefectDojo
-        if: github.event_name != 'pull_request'
+      - name: Send PR report to DefectDojo
+        if: >-
+          github.event_name == 'pull_request' &&
+          steps.scan.outputs.report_ready == 'true' &&
+          github.event.pull_request.head.repo.full_name == github.repository
         env:
           DD_URL: ${{ secrets.DEFECTDOJO_URL }}
           DD_TOKEN: ${{ secrets.DEFECTDOJO_API_TOKEN }}
           DD_PRODUCT_TYPE: ${{ secrets.DEFECTDOJO_PRODUCT_TYPE_NAME }}
           DD_PRODUCT: ${{ secrets.DEFECTDOJO_PRODUCT_NAME }}
           DD_ENGAGEMENT: ${{ secrets.DEFECTDOJO_ENGAGEMENT_NAME }}
+          DD_COMMIT: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BRANCH: ${{ github.head_ref }}
+        shell: bash
         run: |
-          test -s semgrep.json || { echo "::error::No se generó semgrep.json"; exit 1; }
+          set -euo pipefail
+
+          REPORT="$RUNNER_TEMP/semgrep-results/semgrep.json"
+
+          test -s "$REPORT" || {
+            echo "::error::No se generó semgrep.json."
+            exit 1
+          }
+
           [ -n "$DD_URL" ] || { echo "::error::Falta DEFECTDOJO_URL en Dev"; exit 1; }
           [ -n "$DD_TOKEN" ] || { echo "::error::Falta DEFECTDOJO_API_TOKEN en Dev"; exit 1; }
           [ -n "$DD_PRODUCT_TYPE" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_TYPE_NAME en Dev"; exit 1; }
           [ -n "$DD_PRODUCT" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_NAME en Dev"; exit 1; }
           [ -n "$DD_ENGAGEMENT" ] || { echo "::error::Falta DEFECTDOJO_ENGAGEMENT_NAME en Dev"; exit 1; }
 
-          BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
-          echo "Enviando resultados: $DD_PRODUCT / $DD_ENGAGEMENT / Semgrep $BRANCH"
+          echo "Enviando reporte de Semgrep al Test del PR #$PR_NUMBER"
 
           curl --fail-with-body --silent --show-error \
             --request POST \
@@ -117,8 +385,22 @@ jobs:
             --form "product_type_name=$DD_PRODUCT_TYPE" \
             --form "product_name=$DD_PRODUCT" \
             --form "engagement_name=$DD_ENGAGEMENT" \
-            --form "test_title=Semgrep $BRANCH" \
+            --form "test_title=Semgrep PR #$PR_NUMBER" \
             --form "auto_create_context=true" \
-            --form "branch_tag=$BRANCH" \
-            --form "commit_hash=$GITHUB_SHA" \
-            --form "file=@semgrep.json;type=application/json"
+            --form "close_old_findings=true" \
+            --form "branch_tag=$PR_BRANCH" \
+            --form "commit_hash=$DD_COMMIT" \
+            --form "file=@$REPORT;type=application/json"
+
+      - name: Fail PR if Semgrep found issues
+        if: >-
+          always() &&
+          github.event_name == 'pull_request' &&
+          steps.scan.outputs.report_ready == 'true' &&
+          steps.scan.outputs.has_findings == 'true'
+        shell: bash
+        env:
+          FINDING_COUNT: ${{ steps.scan.outputs.finding_count }}
+        run: |
+          echo "::error::Semgrep encontró $FINDING_COUNT hallazgo(s) en cambios del PR."
+          exit 1
