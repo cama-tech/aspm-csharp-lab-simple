@@ -22,12 +22,22 @@ resource "aws_s3_bucket_public_access_block" "aspm_lab" {
   restrict_public_buckets = false
 }
 
-resource "aws_s3_bucket_public_access_block-1" "aspm_lab" {
-  bucket                  = aws_s3_bucket.aspm_lab.id
-  block_public_acls       = false
-  block_public_policy     = false
-  ignore_public_acls      = false
-  restrict_public_buckets = false
+# LAB-IAC-001: Allow anonymous public read access
+resource "aws_s3_bucket_policy" "aspm_lab_public" {
+  bucket = aws_s3_bucket.aspm_lab.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "PublicReadAccess"
+        Effect    = "Allow"
+        Principal = "*"
+        Action    = "s3:GetObject"
+        Resource  = "${aws_s3_bucket.aspm_lab.arn}/*"
+      }
+    ]
+  })
 }
 
 # LAB-IAC-CRITICAL-001: database port exposed to the Internet.
