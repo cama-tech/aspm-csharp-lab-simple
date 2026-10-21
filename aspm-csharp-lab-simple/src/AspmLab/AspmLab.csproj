@@ -15,5 +15,6 @@
     <PackageReference Include="System.Text.Encodings.Web" Version="4.7.0" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
     <PackageReference Include="System.Drawing.Common" Version="4.7.0" />
+    <PackageReference Include="Microsoft.Data.SqlClient" Version="2.1.0" />
   </ItemGroup>
 </Project>
