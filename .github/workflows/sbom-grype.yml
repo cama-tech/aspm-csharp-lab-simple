@@ -19,64 +19,346 @@ jobs:
     steps:
       - name: Descargar repositorio
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/head', github.event.pull_request.number) || github.sha }}
 
       - name: Preparar directorio de resultados
-        run: mkdir -p artifacts/sbom
+        shell: bash
+        run: mkdir -p "$RUNNER_TEMP/sbom-results/grype-db"
 
-      - name: Generar SBOM CycloneDX con Syft
+      - name: Generar SBOM y analizar con Grype
+        id: scan
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          docker run --rm \
-            -v "${GITHUB_WORKSPACE}:/repo:ro" \
-            anchore/syft:latest \
-            scan dir:/repo \
-            --exclude "**/bin/**" \
-            --exclude "**/obj/**" \
-            -o cyclonedx-json \
-            > artifacts/sbom/bom.json
+          set -euo pipefail
 
-      - name: Comprobar archivo CycloneDX
+          RESULTS_DIR="$RUNNER_TEMP/sbom-results"
+          BASE_DIR="$RUNNER_TEMP/sbom-base"
+
+          scan_directory() {
+            local source_dir="$1"
+            local label="$2"
+            local db_auto_update="$3"
+            local bom="$RESULTS_DIR/${label}-bom.json"
+            local report="$RESULTS_DIR/${label}-grype.json"
+
+            docker run --rm \
+              -v "$source_dir:/repo:ro" \
+              anchore/syft:latest \
+              scan dir:/repo \
+              --exclude "**/bin/**" \
+              --exclude "**/obj/**" \
+              -o cyclonedx-json \
+              > "$bom"
+
+            test -s "$bom"
+            jq -e '.bomFormat == "CycloneDX"' "$bom" > /dev/null
+            jq -e '(.components // []) | type == "array"' "$bom" > /dev/null
+
+            component_count=$(jq '(.components // []) | length' "$bom")
+            echo "Componentes Syft ($label): $component_count"
+
+            if [ "$component_count" -eq 0 ]; then
+              echo "::warning::Syft no detectó componentes en el SBOM $label. Comprueba que los archivos de dependencias estén presentes."
+            fi
+
+            docker run --rm \
+              -e GRYPE_DB_CACHE_DIR=/grype-db \
+              -e GRYPE_DB_AUTO_UPDATE="$db_auto_update" \
+              -v "$RESULTS_DIR/grype-db:/grype-db:rw" \
+              -v "$RESULTS_DIR:/artifacts:ro" \
+              anchore/grype:latest \
+              "sbom:/artifacts/${label}-bom.json" \
+              -o json \
+              > "$report"
+
+            test -s "$report"
+            jq -e '.matches | type == "array"' "$report" > /dev/null
+          }
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ] || {
+              echo "::error::No se recibieron los SHA base y head del PR."
+              exit 1
+            }
+
+            MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+            echo "Generando SBOM de la base común: $MERGE_BASE"
+
+            git worktree add --detach "$BASE_DIR" "$MERGE_BASE"
+
+            # La primera ejecución descarga o actualiza la base de Grype.
+            scan_directory "$BASE_DIR" base true
+
+            echo "Generando SBOM del PR: $HEAD_SHA"
+
+            # Reutiliza la base descargada en el escaneo anterior.
+            scan_directory "$GITHUB_WORKSPACE" head false
+
+            cp "$RESULTS_DIR/head-grype.json" "$RESULTS_DIR/grype-full.json"
+
+            python3 - \
+              "$RESULTS_DIR/base-grype.json" \
+              "$RESULTS_DIR/head-grype.json" \
+              "$RESULTS_DIR/grype.json" \
+              "$RESULTS_DIR/changed-files.json" \
+              "$MERGE_BASE" \
+              "$HEAD_SHA" <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          base_path, head_path, output_path, changed_path, merge_base, head_sha = sys.argv[1:7]
+
+          def load(path):
+              with open(path, encoding="utf-8") as source:
+                  return json.load(source)
+
+          def normalize_location(value):
+              path = str(value or "").replace("\\", "/")
+              if path.startswith("/repo/"):
+                  path = path[len("/repo/"):]
+              while path.startswith("./"):
+                  path = path[2:]
+              return path.lstrip("/")
+
+          def match_key(match):
+              artifact = match.get("artifact") or {}
+              vulnerability = match.get("vulnerability") or {}
+
+              locations = sorted({
+                  normalize_location(location.get("path"))
+                  for location in artifact.get("locations", [])
+                  if isinstance(location, dict) and location.get("path")
+              })
+
+              package = (
+                  artifact.get("purl")
+                  or "|".join(
+                      str(artifact.get(field) or "")
+                      for field in ("name", "version", "type")
+                  )
+              )
+
+              return (
+                  vulnerability.get("id") or "",
+                  package,
+                  tuple(locations),
+              )
+
+          base_report = load(base_path)
+          head_report = load(head_path)
+
+          base_matches = {
+              match_key(match)
+              for match in base_report.get("matches", [])
+          }
+
+          head_matches = head_report.get("matches", [])
+          new_matches = [
+              match
+              for match in head_matches
+              if match_key(match) not in base_matches
+          ]
+
+          head_report["matches"] = new_matches
+
+          with open(output_path, "w", encoding="utf-8") as output:
+              json.dump(head_report, output, indent=2)
+              output.write("\n")
+
+          changed_raw = subprocess.check_output([
+              "git",
+              "diff",
+              "--name-only",
+              "--diff-filter=ACMRT",
+              "-z",
+              f"{merge_base}...{head_sha}",
+          ])
+
+          changed_files = [
+              path.decode("utf-8", errors="replace")
+              for path in changed_raw.split(b"\0")
+              if path
+          ]
+
+          with open(changed_path, "w", encoding="utf-8") as output:
+              json.dump(changed_files, output, indent=2)
+
+          print(f"Vulnerabilidades en la base: {len(base_matches)}")
+          print(f"Vulnerabilidades en el PR: {len(head_matches)}")
+          print(f"Vulnerabilidades nuevas frente a la base: {len(new_matches)}")
+          print(f"Archivos modificados en el PR: {len(changed_files)}")
+          PY
+
+            cp "$RESULTS_DIR/head-bom.json" "$RESULTS_DIR/bom.json"
+          else
+            echo "Escaneo completo del repositorio para $EVENT_NAME."
+
+            scan_directory "$GITHUB_WORKSPACE" head true
+
+            cp "$RESULTS_DIR/head-bom.json" "$RESULTS_DIR/bom.json"
+            cp "$RESULTS_DIR/head-grype.json" "$RESULTS_DIR/grype-full.json"
+            cp "$RESULTS_DIR/head-grype.json" "$RESULTS_DIR/grype.json"
+            printf '[]\n' > "$RESULTS_DIR/changed-files.json"
+          fi
+
+          REPORT="$RESULTS_DIR/grype.json"
+          jq -e '.matches | type == "array"' "$REPORT" > /dev/null
+
+          FINDING_COUNT=$(jq '.matches | length' "$REPORT")
+          echo "finding_count=$FINDING_COUNT" >> "$GITHUB_OUTPUT"
+          echo "report_ready=true" >> "$GITHUB_OUTPUT"
+
+          if [ "$FINDING_COUNT" -gt 0 ]; then
+            echo "has_findings=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_findings=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Vulnerabilidades en el reporte que se enviará: $FINDING_COUNT"
+
+          jq -r '
+            .matches[]? |
+            [
+              .vulnerability.id,
+              .artifact.name,
+              .artifact.version,
+              .vulnerability.severity,
+              ([.artifact.locations[]?.path] | join(", "))
+            ] | @tsv
+          ' "$REPORT"
+
+      - name: Mostrar vulnerabilidades nuevas en anotaciones del PR
+        if: >-
+          github.event_name == 'pull_request' &&
+          steps.scan.outputs.report_ready == 'true'
+        shell: python3 {0}
+        env:
+          REPORT: ${{ runner.temp }}/sbom-results/grype.json
+          CHANGED_FILES: ${{ runner.temp }}/sbom-results/changed-files.json
         run: |
-          test -s artifacts/sbom/bom.json
-          jq -e '.bomFormat == "CycloneDX"' artifacts/sbom/bom.json
-          jq -e '.components | type == "array"' artifacts/sbom/bom.json
+          import json
+          import os
+
+          with open(os.environ["REPORT"], encoding="utf-8") as source:
+              report = json.load(source)
+
+          with open(os.environ["CHANGED_FILES"], encoding="utf-8") as source:
+              changed_files = set(json.load(source))
+
+          def normalize_path(value):
+              path = str(value or "").replace("\\", "/")
+              if path.startswith("/repo/"):
+                  path = path[len("/repo/"):]
+              while path.startswith("./"):
+                  path = path[2:]
+              return path.lstrip("/")
+
+          def escape_data(value):
+              return (
+                  str(value)
+                  .replace("%", "%25")
+                  .replace("\r", "%0D")
+                  .replace("\n", "%0A")
+              )
+
+          def escape_property(value):
+              return escape_data(value).replace(":", "%3A").replace(",", "%2C")
+
+          annotated = 0
+          without_location = 0
+
+          for match in report.get("matches", []):
+              vulnerability = match.get("vulnerability") or {}
+              artifact = match.get("artifact") or {}
+
+              vuln_id = vulnerability.get("id") or "Vulnerabilidad"
+              package = artifact.get("name") or "Paquete"
+              version = artifact.get("version") or "versión desconocida"
+              severity = vulnerability.get("severity") or "sin severidad"
+              fixed_versions = (vulnerability.get("fix") or {}).get("versions") or []
+
+              message = (
+                  f"{vuln_id}: {package}@{version}; "
+                  f"severidad {severity}"
+              )
+              if fixed_versions:
+                  message += f"; corregir con {', '.join(fixed_versions)}"
+
+              title = escape_property(f"{vuln_id} - {package}")
+
+              locations = {
+                  normalize_path(location.get("path"))
+                  for location in artifact.get("locations", [])
+                  if isinstance(location, dict) and location.get("path")
+              }
+              locations.discard("")
+
+              changed_locations = sorted(locations.intersection(changed_files))
+
+              if changed_locations:
+                  for path in changed_locations:
+                      print(
+                          f"::warning file={escape_property(path)},"
+                          f"title={title}::{escape_data(message)}"
+                      )
+                      annotated += 1
+              else:
+                  print(
+                      f"::warning title={title}::{escape_data(message)} "
+                      "(Grype no indicó una ruta de archivo modificada)"
+                  )
+                  without_location += 1
+
+          print(
+              f"Anotaciones publicadas: {annotated}; "
+              f"hallazgos sin ruta modificada: {without_location}."
+          )
 
       - name: Mostrar componentes encontrados
+        if: always()
+        shell: bash
         run: |
-          jq -r '
-            .components[]? |
-            [.name, .version, (.purl // "Sin PURL")] |
-            @tsv
-          ' artifacts/sbom/bom.json
+          BOM="$RUNNER_TEMP/sbom-results/bom.json"
 
-      - name: Analizar SBOM con Grype
-        run: |
-          docker run --rm \
-            -v "${GITHUB_WORKSPACE}/artifacts/sbom:/artifacts:ro" \
-            anchore/grype:latest \
-            sbom:/artifacts/bom.json \
-            -o json \
-            > artifacts/sbom/grype.json
+          if [ -s "$BOM" ]; then
+            jq -r '
+              .components[]? |
+              [.name, .version, (.purl // "Sin PURL")] |
+              @tsv
+            ' "$BOM"
+          fi
 
-      - name: Comprobar resultado Grype
-        run: |
-          test -s artifacts/sbom/grype.json
-          jq -e '.matches | type == "array"' artifacts/sbom/grype.json
-          echo "Vulnerabilidades encontradas: $(jq '.matches | length' artifacts/sbom/grype.json)"
-
-      - name: Guardar SBOM e informe de Grype
+      - name: Guardar SBOM e informes de Grype
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: aspm-sbom-grype
           path: |
-            artifacts/sbom/bom.json
-            artifacts/sbom/grype.json
+            ${{ runner.temp }}/sbom-results/bom.json
+            ${{ runner.temp }}/sbom-results/base-bom.json
+            ${{ runner.temp }}/sbom-results/grype.json
+            ${{ runner.temp }}/sbom-results/grype-full.json
+            ${{ runner.temp }}/sbom-results/base-grype.json
+            ${{ runner.temp }}/sbom-results/head-grype.json
+            ${{ runner.temp }}/sbom-results/changed-files.json
           if-no-files-found: warn
+          retention-days: 7
 
       - name: Enviar resultados a DefectDojo
         if: >-
-          github.event_name != 'pull_request' ||
-          github.event.pull_request.head.repo.full_name == github.repository
+          always() &&
+          steps.scan.outputs.report_ready == 'true' &&
+          (
+            github.event_name != 'pull_request' ||
+            github.event.pull_request.head.repo.full_name == github.repository
+          )
         env:
           DD_URL: ${{ secrets.DEFECTDOJO_URL }}
           DD_TOKEN: ${{ secrets.DEFECTDOJO_API_TOKEN }}
@@ -84,21 +366,36 @@ jobs:
           DD_PRODUCT: ${{ secrets.DEFECTDOJO_PRODUCT_NAME }}
           DD_ENGAGEMENT: ${{ secrets.DEFECTDOJO_ENGAGEMENT_NAME }}
           DD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BRANCH: ${{ github.head_ref }}
+          REF_BRANCH: ${{ github.ref_name }}
+        shell: bash
         run: |
-          REPORT="artifacts/sbom/grype.json"
+          set -euo pipefail
+
+          REPORT="$RUNNER_TEMP/sbom-results/grype.json"
 
           test -s "$REPORT" || {
-            echo "::error::No se generó artifacts/sbom/grype.json"
+            echo "::error::No se generó grype.json"
             exit 1
           }
+
           [ -n "$DD_URL" ] || { echo "::error::Falta DEFECTDOJO_URL en Dev"; exit 1; }
           [ -n "$DD_TOKEN" ] || { echo "::error::Falta DEFECTDOJO_API_TOKEN en Dev"; exit 1; }
           [ -n "$DD_PRODUCT_TYPE" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_TYPE_NAME en Dev"; exit 1; }
           [ -n "$DD_PRODUCT" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_NAME en Dev"; exit 1; }
           [ -n "$DD_ENGAGEMENT" ] || { echo "::error::Falta DEFECTDOJO_ENGAGEMENT_NAME en Dev"; exit 1; }
 
-          BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
-          echo "Enviando Grype: $DD_PRODUCT / $DD_ENGAGEMENT / $BRANCH"
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            TEST_TITLE="Grype PR #$PR_NUMBER"
+            BRANCH="$PR_BRANCH"
+          else
+            TEST_TITLE="Grype $REF_BRANCH"
+            BRANCH="$REF_BRANCH"
+          fi
+
+          echo "Enviando $DD_PRODUCT / $DD_ENGAGEMENT / $TEST_TITLE"
 
           curl --fail-with-body --silent --show-error \
             --request POST \
@@ -108,8 +405,22 @@ jobs:
             --form "product_type_name=$DD_PRODUCT_TYPE" \
             --form "product_name=$DD_PRODUCT" \
             --form "engagement_name=$DD_ENGAGEMENT" \
-            --form "test_title=Grype $BRANCH" \
+            --form "test_title=$TEST_TITLE" \
             --form "auto_create_context=true" \
+            --form "close_old_findings=true" \
             --form "branch_tag=$BRANCH" \
             --form "commit_hash=$DD_COMMIT" \
             --form "file=@$REPORT;type=application/json"
+
+      - name: Fallar el PR si hay vulnerabilidades nuevas
+        if: >-
+          always() &&
+          github.event_name == 'pull_request' &&
+          steps.scan.outputs.report_ready == 'true' &&
+          steps.scan.outputs.has_findings == 'true'
+        shell: bash
+        env:
+          FINDING_COUNT: ${{ steps.scan.outputs.finding_count }}
+        run: |
+          echo "::error::Grype encontró $FINDING_COUNT vulnerabilidad(es) nuevas frente a la base."
+          exit 1
