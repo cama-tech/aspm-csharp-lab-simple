@@ -515,30 +515,6 @@ app.MapPost("/api/legacy/import", (string payload) =>
     });
 });
 
-// LOW-SAST-001-2: untrusted JSON type metadata is accepted in a lab-only endpoint.
-app.MapPost("/api/legacy/import-2", (string payload) =>
-{
-    var settings = new JsonSerializerSettings { TypeNameHandling = TypeNameHandling.All };
-    var result = JsonConvert.DeserializeObject(payload, settings);
-    return Results.Ok(new
-    {
-        parsedType = result?.GetType().Name ?? "null",
-        typeNameHandling = settings.TypeNameHandling.ToString()
-    });
-});
-
-// LOW-SAST-001-3: untrusted JSON type metadata is accepted in a lab-only endpoint.
-app.MapPost("/api/legacy/import-3", (string payload) =>
-{
-    var settings = new JsonSerializerSettings { TypeNameHandling = TypeNameHandling.All };
-    var result = JsonConvert.DeserializeObject(payload, settings);
-    return Results.Ok(new
-    {
-        parsedType = result?.GetType().Name ?? "null",
-        typeNameHandling = settings.TypeNameHandling.ToString()
-    });
-});
-
 
 // BUSINESS-HIGH-001: IDOR/BOLA. The supplied user is not checked against the owner.
 app.MapGet("/api/orders/{id:int}", (int id, string user) =>
