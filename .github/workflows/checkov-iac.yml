@@ -57,7 +57,6 @@ jobs:
 
           # Checkov puede crear el informe como root.
           sudo chown -R "$(id -u):$(id -g)" "$RESULTS_DIR"
-
           tail -n 100 "$CONSOLE_LOG" || true
 
           test -s "$REPORT" || {
@@ -127,8 +126,7 @@ jobs:
                   if count > 0:
                       line_range = (start, start + count - 1)
                   else:
-                      # Considera las líneas vecinas a una eliminación:
-                      # quitar una configuración segura puede crear un riesgo.
+                      # Una eliminación puede crear un riesgo en las líneas vecinas.
                       adjacent_start = max(start, 1)
                       line_range = (adjacent_start, adjacent_start + 1)
 
@@ -151,16 +149,15 @@ jobs:
 
           def has_valid_range(check):
               line_range = check.get("file_line_range")
-              return (
-                  isinstance(line_range, list)
-                  and len(line_range) >= 2
-                  and all(
-                      isinstance(value, (int, float))
-                      for value in line_range[:2]
-                  )
-                  and int(line_range[0]) > 0
-                  and int(line_range[1]) >= int(line_range[0])
-              )
+              if not isinstance(line_range, list) or len(line_range) < 2:
+                  return False
+
+              try:
+                  start, end = int(line_range[0]), int(line_range[1])
+              except (TypeError, ValueError):
+                  return False
+
+              return start > 0 and end >= start
 
           def overlaps_changed_lines(check, file_path):
               line_range = check.get("file_line_range")
@@ -173,7 +170,7 @@ jobs:
                       in changed_ranges.get(file_path, [])
                   )
 
-              # Sin ubicación válida, conserva el hallazgo si el archivo cambió.
+              # Sin rango válido, conserva el hallazgo si el archivo cambió.
               return file_path in changed_set
 
           with open(report_path, encoding="utf-8") as input_file:
@@ -272,6 +269,112 @@ jobs:
               ]
             | @tsv
           ' "$REPORT"
+
+      - name: Mostrar hallazgos de Checkov en el PR
+        if: >-
+          github.event_name == 'pull_request' &&
+          steps.scan.outputs.report_ready == 'true'
+        shell: python3 {0}
+        env:
+          REPORT: ${{ runner.temp }}/checkov-results/results_json.json
+        run: |
+          import json
+          import os
+          from pathlib import PurePosixPath
+
+          with open(os.environ["REPORT"], encoding="utf-8") as report_file:
+              data = json.load(report_file)
+
+          roots = data if isinstance(data, list) else [data]
+
+          def escape_data(value):
+              return (
+                  str(value)
+                  .replace("%", "%25")
+                  .replace("\r", "%0D")
+                  .replace("\n", "%0A")
+              )
+
+          def escape_property(value):
+              return (
+                  escape_data(value)
+                  .replace(":", "%3A")
+                  .replace(",", "%2C")
+              )
+
+          def report_file_path(finding):
+              absolute_path = str(
+                  finding.get("file_abs_path") or ""
+              ).replace("\\", "/")
+
+              if absolute_path.startswith("/repo/"):
+                  path = absolute_path[len("/repo/"):]
+              else:
+                  path = str(finding.get("file_path") or "")
+                  path = path.replace("\\", "/").lstrip("/")
+
+              normalized = PurePosixPath(path).as_posix()
+              parts = PurePosixPath(normalized).parts
+
+              if not normalized or normalized == "." or ".." in parts:
+                  return None
+
+              return normalized
+
+          findings = []
+          for root in roots:
+              if not isinstance(root, dict):
+                  continue
+
+              results = root.get("results", {})
+              if isinstance(results, dict):
+                  findings.extend(results.get("failed_checks", []))
+
+          annotated = 0
+          without_location = 0
+
+          for finding in findings:
+              if not isinstance(finding, dict):
+                  continue
+
+              path = report_file_path(finding)
+              check_id = finding.get("check_id") or "Checkov"
+              check_name = finding.get("check_name") or "Control fallido"
+              title = escape_property(check_id)
+              message = escape_data(f"{check_id}: {check_name}")
+
+              line_range = finding.get("file_line_range") or []
+              try:
+                  start = int(line_range[0])
+                  end = int(line_range[1])
+                  valid_range = start > 0 and end >= start
+              except (IndexError, TypeError, ValueError):
+                  valid_range = False
+
+              if path and valid_range:
+                  print(
+                      f"::warning file={escape_property(path)},"
+                      f"line={start},endLine={end},"
+                      f"title={title}::{message}"
+                  )
+                  annotated += 1
+              elif path:
+                  print(
+                      f"::warning file={escape_property(path)},"
+                      f"title={title}::{message} (Checkov no indicó línea)"
+                  )
+                  without_location += 1
+              else:
+                  print(
+                      f"::warning title={title}::{message} "
+                      "(Checkov no indicó archivo)"
+                  )
+                  without_location += 1
+
+          print(
+              f"Anotaciones publicadas: {annotated}; "
+              f"hallazgos sin ubicación precisa: {without_location}."
+          )
 
       - name: Guardar informe como artefacto
         if: always()
