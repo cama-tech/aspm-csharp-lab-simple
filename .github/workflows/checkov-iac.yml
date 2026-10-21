@@ -19,37 +19,251 @@ jobs:
     steps:
       - name: Obtener código
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/head', github.event.pull_request.number) || github.sha }}
 
       - name: Preparar resultados
+        shell: bash
         run: mkdir -p "$RUNNER_TEMP/checkov-results"
 
       - name: Ejecutar Checkov
+        id: scan
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          docker run --rm \
+          set -euo pipefail
+
+          RESULTS_DIR="$RUNNER_TEMP/checkov-results"
+          REPORT="$RESULTS_DIR/results_json.json"
+          CONSOLE_LOG="$RESULTS_DIR/checkov-console.log"
+
+          if ! docker run --rm \
             -v "$GITHUB_WORKSPACE:/repo:ro" \
-            -v "$RUNNER_TEMP/checkov-results:/results" \
+            -v "$RESULTS_DIR:/results:rw" \
             bridgecrew/checkov:latest \
             --directory /repo \
             --output json \
             --output-file-path /results \
-            --soft-fail
+            --soft-fail \
+            > "$CONSOLE_LOG" 2>&1; then
+            tail -n 100 "$CONSOLE_LOG" || true
+            echo "::error::Checkov terminó con error."
+            exit 1
+          fi
 
-      - name: Verificar resultado
-        shell: bash
-        run: |
-          REPORT="$RUNNER_TEMP/checkov-results/results_json.json"
+          # Checkov puede crear el informe como root.
+          sudo chown -R "$(id -u):$(id -g)" "$RESULTS_DIR"
 
-          ls -lah "$RUNNER_TEMP/checkov-results"
-          test -s "$REPORT"
+          tail -n 100 "$CONSOLE_LOG" || true
+
+          test -s "$REPORT" || {
+            echo "::error::Checkov no generó results_json.json"
+            exit 1
+          }
+
           jq -e . "$REPORT" > /dev/null
 
-      - name: Mostrar hallazgos
-        shell: bash
-        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ] || {
+              echo "::error::No se recibieron los SHA base y head del PR."
+              exit 1
+            }
+
+            python3 - "$REPORT" "$BASE_SHA" "$HEAD_SHA" <<'PY'
+          import json
+          import re
+          import subprocess
+          import sys
+          from pathlib import PurePosixPath
+
+          report_path, base_sha, head_sha = sys.argv[1:4]
+          hunk_pattern = re.compile(
+              r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@"
+          )
+
+          def git_output(*args):
+              return subprocess.check_output(["git", *args])
+
+          changed_raw = git_output(
+              "diff",
+              "--name-only",
+              "--diff-filter=ACMRT",
+              "-z",
+              f"{base_sha}...{head_sha}",
+          )
+
+          changed_files = [
+              path.decode("utf-8", errors="surrogateescape")
+              for path in changed_raw.split(b"\0")
+              if path
+          ]
+          changed_set = set(changed_files)
+          changed_ranges = {}
+
+          for file_path in changed_files:
+              diff = git_output(
+                  "-c",
+                  "core.quotepath=false",
+                  "diff",
+                  "--unified=0",
+                  "--no-color",
+                  f"{base_sha}...{head_sha}",
+                  "--",
+                  file_path,
+              ).decode("utf-8", errors="replace")
+
+              for line in diff.splitlines():
+                  match = hunk_pattern.match(line)
+                  if not match:
+                      continue
+
+                  start = int(match.group(1))
+                  count = int(match.group(2) or "1")
+
+                  if count > 0:
+                      line_range = (start, start + count - 1)
+                  else:
+                      # Considera las líneas vecinas a una eliminación:
+                      # quitar una configuración segura puede crear un riesgo.
+                      adjacent_start = max(start, 1)
+                      line_range = (adjacent_start, adjacent_start + 1)
+
+                  changed_ranges.setdefault(file_path, []).append(line_range)
+
+          def normalize(path):
+              return PurePosixPath(
+                  str(path or "").replace("\\", "/").lstrip("/")
+              ).as_posix()
+
+          def get_report_file(check):
+              absolute_path = str(
+                  check.get("file_abs_path") or ""
+              ).replace("\\", "/")
+
+              if absolute_path.startswith("/repo/"):
+                  return normalize(absolute_path[len("/repo/"):])
+
+              return normalize(check.get("file_path"))
+
+          def has_valid_range(check):
+              line_range = check.get("file_line_range")
+              return (
+                  isinstance(line_range, list)
+                  and len(line_range) >= 2
+                  and all(
+                      isinstance(value, (int, float))
+                      for value in line_range[:2]
+                  )
+                  and int(line_range[0]) > 0
+                  and int(line_range[1]) >= int(line_range[0])
+              )
+
+          def overlaps_changed_lines(check, file_path):
+              line_range = check.get("file_line_range")
+
+              if has_valid_range(check):
+                  start, end = int(line_range[0]), int(line_range[1])
+                  return any(
+                      start <= changed_end and end >= changed_start
+                      for changed_start, changed_end
+                      in changed_ranges.get(file_path, [])
+                  )
+
+              # Sin ubicación válida, conserva el hallazgo si el archivo cambió.
+              return file_path in changed_set
+
+          with open(report_path, encoding="utf-8") as input_file:
+              data = json.load(input_file)
+
+          roots = data if isinstance(data, list) else [data]
+          before = 0
+          kept = 0
+          without_valid_location = 0
+          unmatched_paths = set()
+
+          for root in roots:
+              if not isinstance(root, dict):
+                  continue
+
+              results = root.get("results")
+              if not isinstance(results, dict):
+                  continue
+
+              checks = results.get("failed_checks")
+              if not isinstance(checks, list):
+                  continue
+
+              before += len(checks)
+              filtered = []
+
+              for check in checks:
+                  if not isinstance(check, dict):
+                      continue
+
+                  file_path = get_report_file(check)
+
+                  if file_path not in changed_set:
+                      if file_path:
+                          unmatched_paths.add(file_path)
+                      continue
+
+                  if overlaps_changed_lines(check, file_path):
+                      filtered.append(check)
+                      if not has_valid_range(check):
+                          without_valid_location += 1
+
+              results["failed_checks"] = filtered
+              kept += len(filtered)
+
+              summary = root.get("summary")
+              if isinstance(summary, dict) and "failed" in summary:
+                  summary["failed"] = len(filtered)
+
+          with open(report_path, "w", encoding="utf-8") as output_file:
+              json.dump(data, output_file, indent=2)
+              output_file.write("\n")
+
+          print(f"Archivos modificados en el PR: {len(changed_files)}")
+          print(f"Hallazgos antes del filtro: {before}")
+          print(f"Hallazgos asociados a cambios del PR: {kept}")
+          print(f"Hallazgos conservados sin rango válido: {without_valid_location}")
+
+          if unmatched_paths:
+              print("::notice::Algunas rutas del reporte no coincidieron con archivos del PR.")
+              for path in sorted(unmatched_paths)[:10]:
+                  print(f"Ruta sin coincidencia: {path}")
+          PY
+          fi
+
+          FINDING_COUNT=$(jq '
+            if type == "array" then
+              [.[] | .results.failed_checks[]?] | length
+            else
+              [.results.failed_checks[]?] | length
+            end
+          ' "$REPORT")
+
+          echo "finding_count=$FINDING_COUNT" >> "$GITHUB_OUTPUT"
+          echo "report_ready=true" >> "$GITHUB_OUTPUT"
+
+          if [ "$FINDING_COUNT" -gt 0 ]; then
+            echo "has_findings=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_findings=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Hallazgos en el alcance escaneado: $FINDING_COUNT"
+
           jq -r '
-            (if type == "array" then .[] else . end)
-            | .results.failed_checks[]?
+            if type == "array" then
+              .[] | .results.failed_checks[]?
+            else
+              .results.failed_checks[]?
+            end
             | [
                 .check_id,
                 .check_name,
@@ -57,19 +271,23 @@ jobs:
                 (.file_line_range // [] | tostring)
               ]
             | @tsv
-          ' "$RUNNER_TEMP/checkov-results/results_json.json"
+          ' "$REPORT"
 
       - name: Guardar informe como artefacto
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: aspm-iac-checkov-results
-          path: ${{ runner.temp }}/checkov-results/results_json.json
+          path: |
+            ${{ runner.temp }}/checkov-results/results_json.json
+            ${{ runner.temp }}/checkov-results/checkov-console.log
           if-no-files-found: warn
+          retention-days: 7
 
-      - name: Enviar resultados a DefectDojo
+      - name: Enviar reporte del PR a DefectDojo
         if: >-
-          github.event_name != 'pull_request' ||
+          github.event_name == 'pull_request' &&
+          steps.scan.outputs.report_ready == 'true' &&
           github.event.pull_request.head.repo.full_name == github.repository
         env:
           DD_URL: ${{ secrets.DEFECTDOJO_URL }}
@@ -77,23 +295,27 @@ jobs:
           DD_PRODUCT_TYPE: ${{ secrets.DEFECTDOJO_PRODUCT_TYPE_NAME }}
           DD_PRODUCT: ${{ secrets.DEFECTDOJO_PRODUCT_NAME }}
           DD_ENGAGEMENT: ${{ secrets.DEFECTDOJO_ENGAGEMENT_NAME }}
-          DD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          DD_COMMIT: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BRANCH: ${{ github.head_ref }}
         shell: bash
         run: |
+          set -euo pipefail
+
           REPORT="$RUNNER_TEMP/checkov-results/results_json.json"
 
           test -s "$REPORT" || {
             echo "::error::No se generó results_json.json"
             exit 1
           }
+
           [ -n "$DD_URL" ] || { echo "::error::Falta DEFECTDOJO_URL en Dev"; exit 1; }
           [ -n "$DD_TOKEN" ] || { echo "::error::Falta DEFECTDOJO_API_TOKEN en Dev"; exit 1; }
           [ -n "$DD_PRODUCT_TYPE" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_TYPE_NAME en Dev"; exit 1; }
           [ -n "$DD_PRODUCT" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_NAME en Dev"; exit 1; }
           [ -n "$DD_ENGAGEMENT" ] || { echo "::error::Falta DEFECTDOJO_ENGAGEMENT_NAME en Dev"; exit 1; }
 
-          BRANCH="${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}"
-          echo "Enviando Checkov: $DD_PRODUCT / $DD_ENGAGEMENT / $BRANCH"
+          echo "Enviando reporte de Checkov al Test del PR #$PR_NUMBER"
 
           curl --fail-with-body --silent --show-error \
             --request POST \
@@ -103,8 +325,22 @@ jobs:
             --form "product_type_name=$DD_PRODUCT_TYPE" \
             --form "product_name=$DD_PRODUCT" \
             --form "engagement_name=$DD_ENGAGEMENT" \
-            --form "test_title=Checkov $BRANCH" \
+            --form "test_title=Checkov PR #$PR_NUMBER" \
             --form "auto_create_context=true" \
-            --form "branch_tag=$BRANCH" \
+            --form "close_old_findings=true" \
+            --form "branch_tag=$PR_BRANCH" \
             --form "commit_hash=$DD_COMMIT" \
             --form "file=@$REPORT;type=application/json"
+
+      - name: Fallar el PR si hay hallazgos
+        if: >-
+          always() &&
+          github.event_name == 'pull_request' &&
+          steps.scan.outputs.report_ready == 'true' &&
+          steps.scan.outputs.has_findings == 'true'
+        shell: bash
+        env:
+          FINDING_COUNT: ${{ steps.scan.outputs.finding_count }}
+        run: |
+          echo "::error::Checkov encontró $FINDING_COUNT hallazgo(s) asociados a cambios del PR."
+          exit 1
