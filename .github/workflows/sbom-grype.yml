@@ -16,16 +16,29 @@ jobs:
     runs-on: ubuntu-latest
     environment: Dev
 
+    env:
+      PROJECT_REL: aspm-csharp-lab-simple/src/AspmLab/AspmLab.csproj
+      SYFT_IMAGE: anchore/syft:v1.55.0
+      GRYPE_IMAGE: anchore/grype:v0.120.1
+
     steps:
-      - name: Descargar repositorio
-        uses: actions/checkout@v4
+      - name: Obtener código
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
           ref: ${{ github.event_name == 'pull_request' && format('refs/pull/{0}/head', github.event.pull_request.number) || github.sha }}
 
-      - name: Preparar directorio de resultados
+      - name: Preparar .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Preparar resultados
         shell: bash
-        run: mkdir -p "$RUNNER_TEMP/sbom-results/grype-db"
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/sbom-results/grype-db"
 
       - name: Generar SBOM y analizar con Grype
         id: scan
@@ -37,20 +50,65 @@ jobs:
         run: |
           set -euo pipefail
 
-          RESULTS_DIR="$RUNNER_TEMP/sbom-results"
+          OUT="$RUNNER_TEMP/sbom-results"
+          DB_DIR="$OUT/grype-db"
           BASE_DIR="$RUNNER_TEMP/sbom-base"
+          PROJECT="$GITHUB_WORKSPACE/$PROJECT_REL"
 
-          scan_directory() {
+          mkdir -p "$OUT"
+
+          copy_lock_files() {
             local source_dir="$1"
             local label="$2"
-            local db_auto_update="$3"
-            local bom="$RESULTS_DIR/${label}-bom.json"
-            local report="$RESULTS_DIR/${label}-grype.json"
+            local destination="$OUT/lockfiles/$label"
+
+            mkdir -p "$destination"
+
+            while IFS= read -r -d '' lock_file; do
+              local relative_path="${lock_file#"$source_dir"/}"
+              mkdir -p "$destination/$(dirname "$relative_path")"
+              cp -- "$lock_file" "$destination/$relative_path"
+            done < <(
+              find "$source_dir" \
+                -type f \
+                -name packages.lock.json \
+                -not -path '*/bin/*' \
+                -not -path '*/obj/*' \
+                -print0
+            )
+          }
+
+          scan_tree() {
+            local source_dir="$1"
+            local label="$2"
+            local update_db="$3"
+            local result_dir="$OUT/$label"
+            local project_file="$source_dir/$PROJECT_REL"
+            local bom="$result_dir/bom.json"
+            local grype_report="$result_dir/grype.json"
+            local nuget_count
+
+            mkdir -p "$result_dir"
+
+            if [[ -f "$project_file" ]]; then
+              echo "Restaurando dependencias de $label"
+              dotnet restore "$project_file" \
+                --force-evaluate \
+                -p:RestorePackagesWithLockFile=true \
+                -p:NuGetAudit=false
+            elif [[ "$label" == "head" ]]; then
+              echo "::error::No se encontró el proyecto esperado: $project_file"
+              return 1
+            else
+              echo "El proyecto no existía en la base; se escanea el árbol disponible."
+            fi
+
+            copy_lock_files "$source_dir" "$label"
 
             docker run --rm \
-              -v "$source_dir:/repo:ro" \
-              anchore/syft:latest \
-              scan dir:/repo \
+              -v "$source_dir:/src:ro" \
+              "$SYFT_IMAGE" \
+              scan dir:/src \
               --exclude "**/bin/**" \
               --exclude "**/obj/**" \
               -o cyclonedx-json \
@@ -60,205 +118,148 @@ jobs:
             jq -e '.bomFormat == "CycloneDX"' "$bom" > /dev/null
             jq -e '(.components // []) | type == "array"' "$bom" > /dev/null
 
-            component_count=$(jq '(.components // []) | length' "$bom")
-            echo "Componentes Syft ($label): $component_count"
+            nuget_count=$(
+              jq '[.components[]? | select((.purl // "") | startswith("pkg:nuget/"))] | length' \
+                "$bom"
+            )
+            echo "Paquetes NuGet en SBOM ($label): $nuget_count"
 
-            if [ "$component_count" -eq 0 ]; then
-              echo "::warning::Syft no detectó componentes en el SBOM $label. Comprueba que los archivos de dependencias estén presentes."
+            if [[ "$label" == "head" && "$nuget_count" -eq 0 ]]; then
+              echo "::error::Syft no encontró paquetes NuGet en el proyecto del PR."
+              echo "::error::Revisa que dotnet restore haya generado packages.lock.json."
+              return 1
+            elif [[ "$nuget_count" -eq 0 ]]; then
+              echo "::warning::El SBOM de $label no contiene paquetes NuGet."
             fi
 
+            echo "Analizando SBOM ($label) con Grype; actualización de DB: $update_db"
             docker run --rm \
               -e GRYPE_DB_CACHE_DIR=/grype-db \
-              -e GRYPE_DB_AUTO_UPDATE="$db_auto_update" \
-              -v "$RESULTS_DIR/grype-db:/grype-db:rw" \
-              -v "$RESULTS_DIR:/artifacts:ro" \
-              anchore/grype:latest \
-              "sbom:/artifacts/${label}-bom.json" \
+              -e GRYPE_DB_AUTO_UPDATE="$update_db" \
+              -v "$DB_DIR:/grype-db:rw" \
+              -v "$result_dir:/results:rw" \
+              "$GRYPE_IMAGE" \
+              sbom:/results/bom.json \
               -o json \
-              > "$report"
+              > "$grype_report"
 
-            test -s "$report"
-            jq -e '.matches | type == "array"' "$report" > /dev/null
+            test -s "$grype_report"
+            jq -e '.matches | type == "array"' "$grype_report" > /dev/null
+            echo "Vulnerabilidades en $label: $(jq '.matches | length' "$grype_report")"
           }
 
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ] || {
+            [[ -n "$BASE_SHA" && -n "$HEAD_SHA" ]] || {
               echo "::error::No se recibieron los SHA base y head del PR."
               exit 1
             }
 
-            MERGE_BASE=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
-            echo "Generando SBOM de la base común: $MERGE_BASE"
+            git cat-file -e "$BASE_SHA^{commit}" || {
+              echo "::error::No está disponible el commit base $BASE_SHA."
+              exit 1
+            }
+
+            MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"
+            echo "Merge-base del PR: $MERGE_BASE"
 
             git worktree add --detach "$BASE_DIR" "$MERGE_BASE"
+            scan_tree "$BASE_DIR" "base" "true"
+            scan_tree "$GITHUB_WORKSPACE" "head" "false"
 
-            # La primera ejecución descarga o actualiza la base de Grype.
-            scan_directory "$BASE_DIR" base true
-
-            echo "Generando SBOM del PR: $HEAD_SHA"
-
-            # Reutiliza la base descargada en el escaneo anterior.
-            scan_directory "$GITHUB_WORKSPACE" head false
-
-            cp "$RESULTS_DIR/head-grype.json" "$RESULTS_DIR/grype-full.json"
+            cp "$OUT/head/grype.json" "$OUT/grype-full.json"
 
             python3 - \
-              "$RESULTS_DIR/base-grype.json" \
-              "$RESULTS_DIR/head-grype.json" \
-              "$RESULTS_DIR/grype.json" \
-              "$RESULTS_DIR/changed-files.json" \
-              "$MERGE_BASE" \
-              "$HEAD_SHA" <<'PY'
+              "$OUT/base/grype.json" \
+              "$OUT/head/grype.json" \
+              "$OUT/grype.json" <<'PY'
           import json
-          import subprocess
           import sys
+          from pathlib import Path
 
-          base_path, head_path, output_path, changed_path, merge_base, head_sha = sys.argv[1:7]
+          base_path, head_path, output_path = map(Path, sys.argv[1:4])
+          base_report = json.loads(base_path.read_text(encoding="utf-8"))
+          head_report = json.loads(head_path.read_text(encoding="utf-8"))
 
-          def load(path):
-              with open(path, encoding="utf-8") as source:
-                  return json.load(source)
+          def identity(match):
+              vulnerability = match.get("vulnerability", {})
+              artifact = match.get("artifact", {})
 
-          def normalize_location(value):
-              path = str(value or "").replace("\\", "/")
-              if path.startswith("/repo/"):
-                  path = path[len("/repo/"):]
-              while path.startswith("./"):
-                  path = path[2:]
-              return path.lstrip("/")
-
-          def match_key(match):
-              artifact = match.get("artifact") or {}
-              vulnerability = match.get("vulnerability") or {}
-
+              package = artifact.get("purl") or "|".join(
+                  str(artifact.get(field) or "")
+                  for field in ("name", "version", "type")
+              )
               locations = sorted({
-                  normalize_location(location.get("path"))
+                  str(location.get("path") or "")
                   for location in artifact.get("locations", [])
-                  if isinstance(location, dict) and location.get("path")
+                  if location.get("path")
               })
 
-              package = (
-                  artifact.get("purl")
-                  or "|".join(
-                      str(artifact.get(field) or "")
-                      for field in ("name", "version", "type")
-                  )
-              )
-
               return (
-                  vulnerability.get("id") or "",
+                  vulnerability.get("id", ""),
                   package,
                   tuple(locations),
               )
 
-          base_report = load(base_path)
-          head_report = load(head_path)
-
-          base_matches = {
-              match_key(match)
+          base_findings = {
+              identity(match)
               for match in base_report.get("matches", [])
           }
 
-          head_matches = head_report.get("matches", [])
           new_matches = [
               match
-              for match in head_matches
-              if match_key(match) not in base_matches
+              for match in head_report.get("matches", [])
+              if identity(match) not in base_findings
           ]
 
           head_report["matches"] = new_matches
+          output_path.write_text(
+              json.dumps(head_report, indent=2),
+              encoding="utf-8",
+          )
 
-          with open(output_path, "w", encoding="utf-8") as output:
-              json.dump(head_report, output, indent=2)
-              output.write("\n")
-
-          changed_raw = subprocess.check_output([
-              "git",
-              "diff",
-              "--name-only",
-              "--diff-filter=ACMRT",
-              "-z",
-              f"{merge_base}...{head_sha}",
-          ])
-
-          changed_files = [
-              path.decode("utf-8", errors="replace")
-              for path in changed_raw.split(b"\0")
-              if path
-          ]
-
-          with open(changed_path, "w", encoding="utf-8") as output:
-              json.dump(changed_files, output, indent=2)
-
-          print(f"Vulnerabilidades en la base: {len(base_matches)}")
-          print(f"Vulnerabilidades en el PR: {len(head_matches)}")
-          print(f"Vulnerabilidades nuevas frente a la base: {len(new_matches)}")
-          print(f"Archivos modificados en el PR: {len(changed_files)}")
+          print(f"Hallazgos en base: {len(base_findings)}")
+          print(f"Hallazgos nuevos del PR: {len(new_matches)}")
           PY
 
-            cp "$RESULTS_DIR/head-bom.json" "$RESULTS_DIR/bom.json"
+            git worktree remove --force "$BASE_DIR"
           else
-            echo "Escaneo completo del repositorio para $EVENT_NAME."
-
-            scan_directory "$GITHUB_WORKSPACE" head true
-
-            cp "$RESULTS_DIR/head-bom.json" "$RESULTS_DIR/bom.json"
-            cp "$RESULTS_DIR/head-grype.json" "$RESULTS_DIR/grype-full.json"
-            cp "$RESULTS_DIR/head-grype.json" "$RESULTS_DIR/grype.json"
-            printf '[]\n' > "$RESULTS_DIR/changed-files.json"
+            scan_tree "$GITHUB_WORKSPACE" "head" "true"
+            cp "$OUT/head/grype.json" "$OUT/grype-full.json"
+            cp "$OUT/head/grype.json" "$OUT/grype.json"
           fi
 
-          REPORT="$RESULTS_DIR/grype.json"
-          jq -e '.matches | type == "array"' "$REPORT" > /dev/null
+          jq -e '.matches | type == "array"' "$OUT/grype.json" > /dev/null
 
-          FINDING_COUNT=$(jq '.matches | length' "$REPORT")
+          FINDING_COUNT="$(jq '.matches | length' "$OUT/grype.json")"
           echo "finding_count=$FINDING_COUNT" >> "$GITHUB_OUTPUT"
           echo "report_ready=true" >> "$GITHUB_OUTPUT"
 
-          if [ "$FINDING_COUNT" -gt 0 ]; then
+          if [[ "$FINDING_COUNT" -gt 0 ]]; then
             echo "has_findings=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_findings=false" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "Vulnerabilidades en el reporte que se enviará: $FINDING_COUNT"
+          echo "Hallazgos del reporte que se enviará: $FINDING_COUNT"
 
-          jq -r '
-            .matches[]? |
-            [
-              .vulnerability.id,
-              .artifact.name,
-              .artifact.version,
-              .vulnerability.severity,
-              ([.artifact.locations[]?.path] | join(", "))
-            ] | @tsv
-          ' "$REPORT"
-
-      - name: Mostrar vulnerabilidades nuevas en anotaciones del PR
+      - name: Mostrar hallazgos nuevos del PR
         if: >-
           github.event_name == 'pull_request' &&
           steps.scan.outputs.report_ready == 'true'
-        shell: python3 {0}
+        shell: bash
         env:
           REPORT: ${{ runner.temp }}/sbom-results/grype.json
-          CHANGED_FILES: ${{ runner.temp }}/sbom-results/changed-files.json
+          PROJECT_REL: ${{ env.PROJECT_REL }}
+          WORKSPACE: ${{ github.workspace }}
         run: |
+          python3 - "$REPORT" "$PROJECT_REL" "$WORKSPACE" <<'PY'
           import json
           import os
+          import sys
+          from pathlib import PurePosixPath
 
-          with open(os.environ["REPORT"], encoding="utf-8") as source:
-              report = json.load(source)
-
-          with open(os.environ["CHANGED_FILES"], encoding="utf-8") as source:
-              changed_files = set(json.load(source))
-
-          def normalize_path(value):
-              path = str(value or "").replace("\\", "/")
-              if path.startswith("/repo/"):
-                  path = path[len("/repo/"):]
-              while path.startswith("./"):
-                  path = path[2:]
-              return path.lstrip("/")
+          report_path, project_rel, workspace = sys.argv[1:4]
+          report = json.loads(open(report_path, encoding="utf-8").read())
 
           def escape_data(value):
               return (
@@ -269,71 +270,62 @@ jobs:
               )
 
           def escape_property(value):
-              return escape_data(value).replace(":", "%3A").replace(",", "%2C")
-
-          annotated = 0
-          without_location = 0
+              return (
+                  escape_data(value)
+                  .replace(":", "%3A")
+                  .replace(",", "%2C")
+              )
 
           for match in report.get("matches", []):
-              vulnerability = match.get("vulnerability") or {}
-              artifact = match.get("artifact") or {}
+              vulnerability = match.get("vulnerability", {})
+              artifact = match.get("artifact", {})
+              vuln_id = vulnerability.get("id", "Vulnerabilidad")
+              package = artifact.get("name", "paquete")
+              version = artifact.get("version", "")
+              severity = str(vulnerability.get("severity", "Unknown")).lower()
 
-              vuln_id = vulnerability.get("id") or "Vulnerabilidad"
-              package = artifact.get("name") or "Paquete"
-              version = artifact.get("version") or "versión desconocida"
-              severity = vulnerability.get("severity") or "sin severidad"
-              fixed_versions = (vulnerability.get("fix") or {}).get("versions") or []
+              level = {
+                  "critical": "error",
+                  "high": "error",
+                  "medium": "warning",
+                  "low": "notice",
+                  "negligible": "notice",
+              }.get(severity, "warning")
 
-              message = (
-                  f"{vuln_id}: {package}@{version}; "
-                  f"severidad {severity}"
+              locations = artifact.get("locations", [])
+              path = next(
+                  (
+                      str(location.get("path") or "")
+                      for location in locations
+                      if location.get("path")
+                  ),
+                  "",
+              ).replace("\\", "/")
+
+              if path.startswith(workspace.rstrip("/") + "/"):
+                  path = path[len(workspace.rstrip("/")) + 1:]
+              for prefix in ("/src/", "/repo/"):
+                  if path.startswith(prefix):
+                      path = path[len(prefix):]
+
+              if path.endswith("/packages.lock.json"):
+                  candidate = str(PurePosixPath(path).parent / "AspmLab.csproj")
+                  if os.path.isfile(os.path.join(workspace, candidate)):
+                      path = candidate
+
+              title = escape_property(vuln_id)
+              message = escape_data(
+                  f"{vuln_id}: {package} {version} — severidad {severity}"
               )
-              if fixed_versions:
-                  message += f"; corregir con {', '.join(fixed_versions)}"
 
-              title = escape_property(f"{vuln_id} - {package}")
-
-              locations = {
-                  normalize_path(location.get("path"))
-                  for location in artifact.get("locations", [])
-                  if isinstance(location, dict) and location.get("path")
-              }
-              locations.discard("")
-
-              changed_locations = sorted(locations.intersection(changed_files))
-
-              if changed_locations:
-                  for path in changed_locations:
-                      print(
-                          f"::warning file={escape_property(path)},"
-                          f"title={title}::{escape_data(message)}"
-                      )
-                      annotated += 1
-              else:
+              if path and not path.startswith("../"):
                   print(
-                      f"::warning title={title}::{escape_data(message)} "
-                      "(Grype no indicó una ruta de archivo modificada)"
+                      f"::{level} file={escape_property(path)},"
+                      f"title={title}::{message}"
                   )
-                  without_location += 1
-
-          print(
-              f"Anotaciones publicadas: {annotated}; "
-              f"hallazgos sin ruta modificada: {without_location}."
-          )
-
-      - name: Mostrar componentes encontrados
-        if: always()
-        shell: bash
-        run: |
-          BOM="$RUNNER_TEMP/sbom-results/bom.json"
-
-          if [ -s "$BOM" ]; then
-            jq -r '
-              .components[]? |
-              [.name, .version, (.purl // "Sin PURL")] |
-              @tsv
-            ' "$BOM"
-          fi
+              else:
+                  print(f"::{level} title={title}::{message}")
+          PY
 
       - name: Guardar SBOM e informes de Grype
         if: always()
@@ -341,17 +333,17 @@ jobs:
         with:
           name: aspm-sbom-grype
           path: |
-            ${{ runner.temp }}/sbom-results/bom.json
-            ${{ runner.temp }}/sbom-results/base-bom.json
-            ${{ runner.temp }}/sbom-results/grype.json
+            ${{ runner.temp }}/sbom-results/base/bom.json
+            ${{ runner.temp }}/sbom-results/base/grype.json
+            ${{ runner.temp }}/sbom-results/head/bom.json
+            ${{ runner.temp }}/sbom-results/head/grype.json
             ${{ runner.temp }}/sbom-results/grype-full.json
-            ${{ runner.temp }}/sbom-results/base-grype.json
-            ${{ runner.temp }}/sbom-results/head-grype.json
-            ${{ runner.temp }}/sbom-results/changed-files.json
+            ${{ runner.temp }}/sbom-results/grype.json
+            ${{ runner.temp }}/sbom-results/lockfiles/**
           if-no-files-found: warn
           retention-days: 7
 
-      - name: Enviar resultados a DefectDojo
+      - name: Enviar reporte a DefectDojo
         if: >-
           always() &&
           steps.scan.outputs.report_ready == 'true' &&
@@ -366,10 +358,7 @@ jobs:
           DD_PRODUCT: ${{ secrets.DEFECTDOJO_PRODUCT_NAME }}
           DD_ENGAGEMENT: ${{ secrets.DEFECTDOJO_ENGAGEMENT_NAME }}
           DD_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
-          EVENT_NAME: ${{ github.event_name }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_BRANCH: ${{ github.head_ref }}
-          REF_BRANCH: ${{ github.ref_name }}
         shell: bash
         run: |
           set -euo pipefail
@@ -377,7 +366,7 @@ jobs:
           REPORT="$RUNNER_TEMP/sbom-results/grype.json"
 
           test -s "$REPORT" || {
-            echo "::error::No se generó grype.json"
+            echo "::error::No se generó el reporte filtrado de Grype."
             exit 1
           }
 
@@ -387,15 +376,15 @@ jobs:
           [ -n "$DD_PRODUCT" ] || { echo "::error::Falta DEFECTDOJO_PRODUCT_NAME en Dev"; exit 1; }
           [ -n "$DD_ENGAGEMENT" ] || { echo "::error::Falta DEFECTDOJO_ENGAGEMENT_NAME en Dev"; exit 1; }
 
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            BRANCH="$GITHUB_HEAD_REF"
             TEST_TITLE="Grype PR #$PR_NUMBER"
-            BRANCH="$PR_BRANCH"
           else
-            TEST_TITLE="Grype $REF_BRANCH"
-            BRANCH="$REF_BRANCH"
+            BRANCH="$GITHUB_REF_NAME"
+            TEST_TITLE="Grype $BRANCH"
           fi
 
-          echo "Enviando $DD_PRODUCT / $DD_ENGAGEMENT / $TEST_TITLE"
+          echo "Enviando $TEST_TITLE a DefectDojo"
 
           curl --fail-with-body --silent --show-error \
             --request POST \
@@ -412,7 +401,7 @@ jobs:
             --form "commit_hash=$DD_COMMIT" \
             --form "file=@$REPORT;type=application/json"
 
-      - name: Fallar el PR si hay vulnerabilidades nuevas
+      - name: Fallar si el PR introduce vulnerabilidades
         if: >-
           always() &&
           github.event_name == 'pull_request' &&
@@ -422,5 +411,5 @@ jobs:
         env:
           FINDING_COUNT: ${{ steps.scan.outputs.finding_count }}
         run: |
-          echo "::error::Grype encontró $FINDING_COUNT vulnerabilidad(es) nuevas frente a la base."
+          echo "::error::Grype encontró $FINDING_COUNT vulnerabilidad(es) nuevas respecto al merge-base."
           exit 1
